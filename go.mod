@@ -317,7 +317,7 @@ replace (
 	k8s.io/kube-scheduler => github.com/kubeedge/kubernetes/staging/src/k8s.io/kube-scheduler v1.31.12-kubeedge3
 	k8s.io/kubectl => github.com/kubeedge/kubernetes/staging/src/k8s.io/kubectl v1.31.12-kubeedge3
 	k8s.io/kubelet => github.com/kubeedge/kubernetes/staging/src/k8s.io/kubelet v1.31.12-kubeedge3
-	k8s.io/kubernetes => github.com/kubeedge/kubernetes v1.31.12-kubeedge3
+	k8s.io/kubernetes => github.com/2youio/kubeedge-kubernetes v1.31.12-kubeedge-2youio1
 	k8s.io/metrics => github.com/kubeedge/kubernetes/staging/src/k8s.io/metrics v1.31.12-kubeedge3
 	k8s.io/mount-utils => github.com/kubeedge/kubernetes/staging/src/k8s.io/mount-utils v1.31.12-kubeedge3
 	k8s.io/node-api => github.com/kubeedge/kubernetes/staging/src/k8s.io/node-api v1.31.12-kubeedge3
