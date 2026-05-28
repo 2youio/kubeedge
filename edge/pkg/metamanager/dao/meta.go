@@ -112,3 +112,17 @@ func QueryAllMeta(key string, condition string) (*[]Meta, error) {
 
 	return meta, nil
 }
+
+// QueryMetaByKeyPrefix returns meta values whose Key starts with prefix.
+func QueryMetaByKeyPrefix(prefix string) (*[]string, error) {
+	meta := new([]Meta)
+	_, err := dbm.DBAccess.Raw("SELECT * FROM meta WHERE key LIKE ?", prefix+"%").QueryRows(meta)
+	if err != nil {
+		return nil, err
+	}
+	var result []string
+	for _, v := range *meta {
+		result = append(result, v.Value)
+	}
+	return &result, nil
+}

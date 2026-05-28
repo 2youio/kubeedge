@@ -159,6 +159,7 @@ func TestKeyFunc(t *testing.T) {
 		expected  string
 	}{
 		{
+			// Zero ExpirationTimestamp: defensive fallback returns base key only.
 			name:      "Basic TokenRequest",
 			saName:    "test-sa",
 			namespace: "default",
@@ -205,6 +206,31 @@ func TestKeyFunc(t *testing.T) {
 			assert.Equal(test.expected, result)
 		})
 	}
+
+	// Non-zero ExpirationTimestamp: key is suffixed with UnixNano of the expiry.
+	t.Run("per-generation key with ExpirationTimestamp", func(t *testing.T) {
+		fixedTime := time.Unix(1700000000, 0)
+		tr := &authenticationv1.TokenRequest{
+			Spec: authenticationv1.TokenRequestSpec{
+				Audiences:         []string{"aud"},
+				ExpirationSeconds: func() *int64 { i := int64(600); return &i }(),
+			},
+			Status: authenticationv1.TokenRequestStatus{
+				ExpirationTimestamp: metav1.NewTime(fixedTime),
+			},
+		}
+		base := `"my-sa"/"ns"/[]string{"aud"}/600/v1.BoundObjectReference{Kind:"", APIVersion:"", Name:"", UID:""}`
+		expected := fmt.Sprintf("%s/%d", base, fixedTime.UnixNano())
+		assert.Equal(expected, KeyFunc("my-sa", "ns", tr))
+
+		// Two calls with the same timestamp must produce identical keys.
+		assert.Equal(KeyFunc("my-sa", "ns", tr), KeyFunc("my-sa", "ns", tr))
+
+		// A different expiry timestamp must produce a different key.
+		tr2 := tr.DeepCopy()
+		tr2.Status.ExpirationTimestamp = metav1.NewTime(fixedTime.Add(time.Hour))
+		assert.NotEqual(KeyFunc("my-sa", "ns", tr), KeyFunc("my-sa", "ns", tr2))
+	})
 }
 
 func TestHandleServiceAccountTokenFromMetaDB(t *testing.T) {
@@ -459,105 +485,287 @@ func TestGetTokenLocally(t *testing.T) {
 			ExpirationSeconds: func() *int64 { i := int64(3600); return &i }(),
 		},
 	}
-	key := KeyFunc(name, namespace, tr)
+
+	now := time.Now()
+	sec := func(i int64) *int64 { return &i }
+
+	freshTR := &authenticationv1.TokenRequest{
+		Spec:   authenticationv1.TokenRequestSpec{ExpirationSeconds: sec(3600)},
+		Status: authenticationv1.TokenRequestStatus{ExpirationTimestamp: metav1.NewTime(now.Add(time.Hour)), Token: "fresh-token"},
+	}
+	freshBytes, _ := json.Marshal(freshTR)
+
+	newerTR := &authenticationv1.TokenRequest{
+		Spec:   authenticationv1.TokenRequestSpec{ExpirationSeconds: sec(3600)},
+		Status: authenticationv1.TokenRequestStatus{ExpirationTimestamp: metav1.NewTime(now.Add(2 * time.Hour)), Token: "newer-token"},
+	}
+	newerBytes, _ := json.Marshal(newerTR)
+
+	expiredTR := &authenticationv1.TokenRequest{
+		Spec:   authenticationv1.TokenRequestSpec{ExpirationSeconds: sec(3600)},
+		Status: authenticationv1.TokenRequestStatus{ExpirationTimestamp: metav1.NewTime(now.Add(-time.Hour))},
+	}
+	expiredBytes, _ := json.Marshal(expiredTR)
+
+	// Within 20% of a 1h TTL → requiresRefresh returns true.
+	nearExpiryTR := &authenticationv1.TokenRequest{
+		Spec:   authenticationv1.TokenRequestSpec{ExpirationSeconds: sec(3600)},
+		Status: authenticationv1.TokenRequestStatus{ExpirationTimestamp: metav1.NewTime(now.Add(5 * time.Minute)), Token: "near-token"},
+	}
+	nearExpiryBytes, _ := json.Marshal(nearExpiryTR)
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
-	validTR := &authenticationv1.TokenRequest{
-		Spec: authenticationv1.TokenRequestSpec{
-			ExpirationSeconds: func() *int64 { i := int64(3600); return &i }(),
-		},
-		Status: authenticationv1.TokenRequestStatus{
-			ExpirationTimestamp: metav1.NewTime(time.Now().Add(time.Hour)),
-		},
-	}
-	validTRBytes, err := json.Marshal(validTR)
-	if err != nil {
-		t.Fatalf("Failed to marshal valid token request: %v", err)
-	}
-
-	patches.ApplyFunc(dao.QueryMeta, func(k, v string) (*[]string, error) {
-		assert.Equal("key", k)
-		assert.Equal(key, v)
-		return &[]string{string(validTRBytes)}, nil
+	// DB error.
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
+		return nil, errors.New("db error")
 	})
-
 	result, err := getTokenLocally(name, namespace, tr)
-	assert.NoError(err)
-	assert.NotNil(result)
+	assert.Error(err)
+	assert.Nil(result)
+	assert.Contains(err.Error(), "db error")
 
+	// nil result → no cached token.
 	patches.Reset()
-	patches.ApplyFunc(dao.QueryMeta, func(k, v string) (*[]string, error) {
-		return nil, errors.New("query meta error")
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
+		return nil, nil
 	})
-
 	result, err = getTokenLocally(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
-	assert.Contains(err.Error(), "query meta error")
+	assert.Contains(err.Error(), "no cached token")
 
+	// Empty slice → no cached token.
 	patches.Reset()
-	patches.ApplyFunc(dao.QueryMeta, func(k, v string) (*[]string, error) {
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{}, nil
 	})
-
 	result, err = getTokenLocally(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
-	assert.Contains(err.Error(), "query meta")
-	assert.Contains(err.Error(), "length error")
+	assert.Contains(err.Error(), "no cached token")
 
+	// Single valid unexpired generation.
 	patches.Reset()
-	patches.ApplyFunc(dao.QueryMeta, func(k, v string) (*[]string, error) {
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
+		return &[]string{string(freshBytes)}, nil
+	})
+	result, err = getTokenLocally(name, namespace, tr)
+	assert.NoError(err)
+	assert.NotNil(result)
+	assert.Equal("fresh-token", result.Status.Token)
+
+	// Multiple generations → newest unexpired wins.
+	patches.Reset()
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
+		return &[]string{string(freshBytes), string(newerBytes)}, nil
+	})
+	result, err = getTokenLocally(name, namespace, tr)
+	assert.NoError(err)
+	assert.NotNil(result)
+	assert.Equal("newer-token", result.Status.Token)
+
+	// All expired → no un-expired cached token.
+	patches.Reset()
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
+		return &[]string{string(expiredBytes)}, nil
+	})
+	result, err = getTokenLocally(name, namespace, tr)
+	assert.Error(err)
+	assert.Nil(result)
+	assert.Contains(err.Error(), "no un-expired cached token")
+
+	// All invalid JSON → no un-expired cached token.
+	patches.Reset()
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{"invalid-json"}, nil
 	})
-
 	result, err = getTokenLocally(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
+	assert.Contains(err.Error(), "no un-expired cached token")
 
+	// Mixed: invalid + expired + valid → returns valid.
 	patches.Reset()
-	expiredTR := &authenticationv1.TokenRequest{
-		Spec: authenticationv1.TokenRequestSpec{
-			ExpirationSeconds: func() *int64 { i := int64(3600); return &i }(),
-		},
-		Status: authenticationv1.TokenRequestStatus{
-			ExpirationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
-		},
-	}
-	expiredTRBytes, err := json.Marshal(expiredTR)
-	if err != nil {
-		t.Fatalf("Failed to marshal expired token request: %v", err)
-	}
-
-	patches.ApplyFunc(dao.QueryMeta, func(k, v string) (*[]string, error) {
-		return &[]string{string(expiredTRBytes)}, nil
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
+		return &[]string{"invalid-json", string(expiredBytes), string(freshBytes)}, nil
 	})
+	result, err = getTokenLocally(name, namespace, tr)
+	assert.NoError(err)
+	assert.NotNil(result)
+	assert.Equal("fresh-token", result.Status.Token)
 
+	// Newest requires refresh → error; no row must be deleted.
+	patches.Reset()
+	var deletedKey string
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
+		return &[]string{string(nearExpiryBytes)}, nil
+	})
 	patches.ApplyFunc(dao.DeleteMetaByKey, func(k string) error {
-		assert.Equal(key, k)
+		deletedKey = k
 		return nil
 	})
-
 	result, err = getTokenLocally(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
-	assert.Contains(err.Error(), "token expired")
+	assert.Contains(err.Error(), "token requires refresh")
+	assert.Empty(deletedKey, "expired token rows must not be deleted during refresh trigger")
+}
+
+func TestGcExpiredTokensOnce(t *testing.T) {
+	assert := assert.New(t)
+
+	now := time.Now()
+
+	expired := authenticationv1.TokenRequest{
+		Status: authenticationv1.TokenRequestStatus{
+			ExpirationTimestamp: metav1.NewTime(now.Add(-time.Hour)),
+		},
+	}
+	expiredBytes, _ := json.Marshal(expired)
+
+	fresh := authenticationv1.TokenRequest{
+		Status: authenticationv1.TokenRequestStatus{
+			ExpirationTimestamp: metav1.NewTime(now.Add(time.Hour)),
+		},
+	}
+	freshBytes, _ := json.Marshal(fresh)
+
+	zero := authenticationv1.TokenRequest{}
+	zeroBytes, _ := json.Marshal(zero)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	// QueryAllMeta error → should not panic.
+	patches.ApplyFunc(dao.QueryAllMeta, func(string, string) (*[]dao.Meta, error) {
+		return nil, errors.New("db error")
+	})
+	gcExpiredTokensOnce()
+
+	// nil result → no-op.
+	patches.Reset()
+	patches.ApplyFunc(dao.QueryAllMeta, func(string, string) (*[]dao.Meta, error) {
+		return nil, nil
+	})
+	gcExpiredTokensOnce()
+
+	// Expired row deleted; fresh and zero-timestamp rows untouched; invalid JSON skipped.
+	patches.Reset()
+	metas := []dao.Meta{
+		{Key: "expired-key", Value: string(expiredBytes)},
+		{Key: "fresh-key", Value: string(freshBytes)},
+		{Key: "zero-key", Value: string(zeroBytes)},
+		{Key: "bad-key", Value: "invalid-json"},
+	}
+	patches.ApplyFunc(dao.QueryAllMeta, func(string, string) (*[]dao.Meta, error) {
+		return &metas, nil
+	})
+	var deletedKeys []string
+	patches.ApplyFunc(dao.DeleteMetaByKey, func(k string) error {
+		deletedKeys = append(deletedKeys, k)
+		return nil
+	})
+	gcExpiredTokensOnce()
+	assert.Equal([]string{"expired-key"}, deletedKeys)
+
+	// Delete error → continues without panic.
+	patches.Reset()
+	patches.ApplyFunc(dao.QueryAllMeta, func(string, string) (*[]dao.Meta, error) {
+		return &[]dao.Meta{{Key: "exp-key", Value: string(expiredBytes)}}, nil
+	})
+	patches.ApplyFunc(dao.DeleteMetaByKey, func(string) error {
+		return errors.New("delete failed")
+	})
+	gcExpiredTokensOnce() // must not panic
+}
+
+// TestTokenCoexistenceDuringRefreshWindow is the end-to-end scenario the
+// per-generation key fix was designed to protect: a pod still holds the old
+// bearer token while the kubelet has already written a refreshed one. Both
+// rows must coexist in metaDB so MetaServer keeps accepting the old bearer
+// until GC removes it after its expiry.
+func TestTokenCoexistenceDuringRefreshWindow(t *testing.T) {
+	assert := assert.New(t)
+
+	now := time.Now()
+	sec := func(i int64) *int64 { return &i }
+
+	// Old generation: 5 min left — still un-expired but within the 20%-of-TTL
+	// refresh threshold (requiresRefresh = true for a 1 h token).
+	oldToken := &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: sec(3600)},
+		Status: authenticationv1.TokenRequestStatus{
+			ExpirationTimestamp: metav1.NewTime(now.Add(5 * time.Minute)),
+			Token:               "old-bearer-token",
+		},
+	}
+	oldTokenBytes, _ := json.Marshal(oldToken)
+	oldKey := KeyFunc("sa", "ns", oldToken)
+
+	// New generation: freshly issued, 1 h remaining — requiresRefresh = false.
+	newToken := &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: sec(3600)},
+		Status: authenticationv1.TokenRequestStatus{
+			ExpirationTimestamp: metav1.NewTime(now.Add(time.Hour)),
+			Token:               "new-bearer-token",
+		},
+	}
+	newTokenBytes, _ := json.Marshal(newToken)
+	newKey := KeyFunc("sa", "ns", newToken)
+
+	assert.NotEqual(oldKey, newKey, "each generation must get a distinct storage key")
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	// --- Phase 1: propagation window — both rows coexist in metaDB ---
+
+	// getTokenLocally must return the newer generation, not the near-expiry old one.
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
+		return &[]string{string(oldTokenBytes), string(newTokenBytes)}, nil
+	})
+	tr := &authenticationv1.TokenRequest{Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: sec(3600)}}
+	got, err := getTokenLocally("sa", "ns", tr)
+	assert.NoError(err)
+	assert.Equal("new-bearer-token", got.Status.Token, "getTokenLocally must return the freshest generation")
+
+	// CheckTokenExist scans all SA token rows; both bearer strings must be recognised
+	// so MetaServer accepts pods still carrying the old token.
+	patches.ApplyFunc(dao.QueryMeta, func(string, string) (*[]string, error) {
+		return &[]string{string(oldTokenBytes), string(newTokenBytes)}, nil
+	})
+	assert.True(CheckTokenExist("old-bearer-token"), "old token must pass MetaServer auth during propagation window")
+	assert.True(CheckTokenExist("new-bearer-token"), "new token must also be accepted")
+
+	// --- Phase 2: old token's expiry passes, GC runs ---
+
+	expiredOld := oldToken.DeepCopy()
+	expiredOld.Status.ExpirationTimestamp = metav1.NewTime(now.Add(-time.Minute))
+	expiredOldBytes, _ := json.Marshal(expiredOld)
 
 	patches.Reset()
-	patches.ApplyFunc(dao.QueryMeta, func(k, v string) (*[]string, error) {
-		return &[]string{string(expiredTRBytes)}, nil
+	patches.ApplyFunc(dao.QueryAllMeta, func(string, string) (*[]dao.Meta, error) {
+		return &[]dao.Meta{
+			{Key: oldKey, Value: string(expiredOldBytes)},
+			{Key: newKey, Value: string(newTokenBytes)},
+		}, nil
 	})
-
+	var deletedKeys []string
 	patches.ApplyFunc(dao.DeleteMetaByKey, func(k string) error {
-		return fmt.Errorf("failed to delete meta by key %s: deletion operation failed", k)
+		deletedKeys = append(deletedKeys, k)
+		return nil
 	})
+	gcExpiredTokensOnce()
+	assert.Equal([]string{oldKey}, deletedKeys, "GC must remove exactly the expired old generation row")
 
-	result, err = getTokenLocally(name, namespace, tr)
-	assert.Error(err)
-	assert.Nil(result)
-	assert.Contains(err.Error(), "failed to delete meta")
+	// After GC: old bearer rejected, new bearer still accepted.
+	patches.ApplyFunc(dao.QueryMeta, func(string, string) (*[]string, error) {
+		return &[]string{string(newTokenBytes)}, nil
+	})
+	assert.False(CheckTokenExist("old-bearer-token"), "old token must be rejected after GC removes its row")
+	assert.True(CheckTokenExist("new-bearer-token"), "new token must remain valid after GC")
 }
 
 func TestGetServiceAccountToken(t *testing.T) {

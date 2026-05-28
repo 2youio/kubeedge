@@ -496,6 +496,47 @@ func TestQueryAllMeta(t *testing.T) {
 	}
 }
 
+// TestQueryMetaByKeyPrefix is function to test QueryMetaByKeyPrefix
+func TestQueryMetaByKeyPrefix(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	ormerMock := beego.NewMockOrmer(mockCtrl)
+	rawSeterMock := beego.NewMockRawSeter(mockCtrl)
+	dbm.DBAccess = ormerMock
+
+	cases := []struct {
+		name         string
+		queryRowsRet int64
+		queryRowsErr error
+	}{
+		{
+			name:         "SuccessCase",
+			queryRowsRet: int64(0),
+			queryRowsErr: nil,
+		},
+		{
+			name:         "FailureCase",
+			queryRowsRet: int64(0),
+			queryRowsErr: errFailedDBOperation,
+		},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			ormerMock.EXPECT().Raw(gomock.Any(), gomock.Any()).Return(rawSeterMock).Times(1)
+			rawSeterMock.EXPECT().QueryRows(gomock.Any()).Return(test.queryRowsRet, test.queryRowsErr).Times(1)
+			result, err := QueryMetaByKeyPrefix("test-prefix")
+			if test.queryRowsErr != err {
+				t.Errorf("QueryMetaByKeyPrefix failed: wanted error %v and got error %v", test.queryRowsErr, err)
+				return
+			}
+			if err == nil && result == nil {
+				t.Errorf("QueryMetaByKeyPrefix returned nil result on success")
+			}
+		})
+	}
+}
+
 // TestIsNonUniqueNameError is function to test IsNonUniqueNameError().
 func TestIsNonUniqueNameError(t *testing.T) {
 	tests := []struct {
