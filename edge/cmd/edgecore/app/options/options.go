@@ -39,6 +39,7 @@ func GetEdgeCoreOptions() *EdgeCoreOptions {
 	return edgeCoreOptions
 }
 
+//go:noinline
 func GetEdgeCoreConfig() *v1alpha2.EdgeCoreConfig {
 	return edgeCoreConfig
 }
