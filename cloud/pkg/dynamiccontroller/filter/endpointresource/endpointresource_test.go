@@ -102,6 +102,7 @@ func setupPatches() *gomonkey.Patches {
 	patches := gomonkey.NewPatches()
 
 	patches.ApplyFuncReturn(filter.GetDynamicResourceInformer, mockInformer)
+	patches.ApplyFuncReturn(filter.GetSyncedResourceLister, mockInformer.Lister(), nil)
 
 	patches.ApplyFunc(meta.Accessor, func(obj interface{}) (metav1.Object, error) {
 		return svc.ObjectMeta.DeepCopy(), nil
@@ -451,4 +452,40 @@ func TestFilterEndpointSliceConversionError(t *testing.T) {
 	}
 
 	filterEndpointSlice("target-node", invalid)
+}
+
+// TestFilterEndpointSliceNilNodeName covers endpoints carrying no nodeName,
+// which are legal and common during pod churn. Dereferencing them panicked the
+// dispatch goroutine and took cloudcore down for every connected node.
+func TestFilterEndpointSliceNilNodeName(t *testing.T) {
+	patches := setupPatches()
+	defer patches.Reset()
+
+	n1 := nodeName1
+	epSlice := &discovery.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-epslice",
+			Namespace: "default",
+			Labels: map[string]string{
+				discovery.LabelServiceName: "test-service",
+			},
+		},
+		Endpoints: []discovery.Endpoint{
+			{Addresses: []string{"192.168.1.1"}, NodeName: &n1},
+			{Addresses: []string{"192.168.1.9"}, NodeName: nil},
+		},
+	}
+
+	unstructEpSlice, err := runtime.DefaultUnstructuredConverter.ToUnstructured(epSlice)
+	assert.NoError(t, err)
+	epSliceUnstructured := &unstructured.Unstructured{Object: unstructEpSlice}
+
+	assert.NotPanics(t, func() { filterEndpointSlice("target-node", epSliceUnstructured) })
+
+	var result discovery.EndpointSlice
+	err = runtime.DefaultUnstructuredConverter.FromUnstructured(epSliceUnstructured.Object, &result)
+	assert.NoError(t, err)
+
+	assert.Len(t, result.Endpoints, 1, "endpoint without nodeName cannot be proven site-local and must be dropped")
+	assert.Equal(t, nodeName1, *result.Endpoints[0].NodeName)
 }
