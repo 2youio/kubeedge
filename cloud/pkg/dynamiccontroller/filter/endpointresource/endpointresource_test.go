@@ -102,6 +102,7 @@ func setupPatches() *gomonkey.Patches {
 	patches := gomonkey.NewPatches()
 
 	patches.ApplyFuncReturn(filter.GetDynamicResourceInformer, mockInformer)
+	patches.ApplyFuncReturn(filter.GetSyncedResourceLister, mockInformer.Lister(), nil)
 
 	patches.ApplyFunc(meta.Accessor, func(obj interface{}) (metav1.Object, error) {
 		return svc.ObjectMeta.DeepCopy(), nil
