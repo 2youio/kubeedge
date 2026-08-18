@@ -32,6 +32,9 @@ func DecodeAndConvert(body []byte, group string) (runtime.Object, error) {
 		// for protobuf serialization. In this case, we fall back to returning a runtime.Unknown object,
 		// which will be serialized as JSON.
 		if runtime.IsNotRegisteredError(err) {
+			if gvk == nil {
+				return &runtime.Unknown{Raw: body, ContentType: runtime.ContentTypeJSON}, nil
+			}
 			//if we are seeing this for a core api resource, then there is a problem with decoding
 			if strings.Contains(gvk.Group, ".k8s.io") || gvk.Group == "" {
 				klog.V(4).Infof("failed to decode core k8s object, this should not happen. Falling back to runtime.Unknown for gvk: %v, err: %v", gvk, err)
