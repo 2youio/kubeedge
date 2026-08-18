@@ -85,7 +85,10 @@ func (f *Factory) Create(req *request.RequestInfo) http.Handler {
 			scope.err(err, w, req)
 			return
 		}
-		responsewriters.WriteObjectNegotiated(scope.Serializer, scope, scope.Kind.GroupVersion(), w, req, 200, retObj, false)
+		// 201, as handlers.CreateResource returned before this handler replaced
+		// it. A client that distinguishes created-from-updated reads the status
+		// code, not the body.
+		responsewriters.WriteObjectNegotiated(scope.Serializer, scope, scope.Kind.GroupVersion(), w, req, http.StatusCreated, retObj, false)
 	}
 	return http.HandlerFunc(h)
 }

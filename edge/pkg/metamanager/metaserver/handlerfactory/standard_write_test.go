@@ -19,6 +19,7 @@ package handlerfactory
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -72,7 +73,7 @@ func TestFactoryCreateImplementation_Success(t *testing.T) {
 
 	handler.ServeHTTP(w, req)
 
-	assert.Equal(t, 200, w.Code)
+	assert.Equal(t, http.StatusCreated, w.Code)
 	assert.Contains(t, w.Body.String(), "nginx-deployment")
 }
 
@@ -151,7 +152,7 @@ func TestFactoryUpdate_Implementation_Success(t *testing.T) {
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
-	assert.Equal(t, 200, w.Code)
+	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), "nginx-deployment")
 }
 
