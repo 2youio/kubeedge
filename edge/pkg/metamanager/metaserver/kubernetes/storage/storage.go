@@ -316,7 +316,10 @@ func (r *REST) Watch(ctx context.Context, options *metainternalversion.ListOptio
 	}
 
 	watcher, err := r.Store.Watch(ctx, options)
-	return newTypedWatcher(watcher, info.APIGroup), err
+	if err != nil {
+		return nil, err
+	}
+	return newTypedWatcher(watcher, info.APIGroup), nil
 }
 
 func (r *REST) Create(ctx context.Context, obj runtime.Object, _ rest.ValidateObjectFunc, options *metav1.CreateOptions) (runtime.Object, error) {
