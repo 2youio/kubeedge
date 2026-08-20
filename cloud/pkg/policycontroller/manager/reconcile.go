@@ -31,6 +31,11 @@ import (
 	commonconstants "github.com/kubeedge/kubeedge/common/constants"
 )
 
+// serviceAccountAccessKind is the kind of policyv1alpha1.ServiceAccountAccess.
+// The generated API package exposes no kind constant, and the scheme the objects
+// are registered in lives in the parent package, so it is spelled out here.
+const serviceAccountAccessKind = "ServiceAccountAccess"
+
 type Controller struct {
 	client.Client
 	client.Reader
@@ -367,6 +372,15 @@ func (c *Controller) send2Edge(acc *policyv1alpha1.ServiceAccountAccess, targets
 	klog.V(4).Infof("send2Edge for serviceaccount %s/%s: %v (%s)",
 		acc.Namespace, acc.Spec.ServiceAccount.Name, targets, opr)
 	sendObj := acc.DeepCopy()
+	// Decoding into a typed object clears TypeMeta, so acc carries no
+	// apiVersion/kind as read back from the API server. Restore them before
+	// filling the message body: edgecore's metaserver imitator decodes this
+	// payload into unstructured.Unstructured, which rejects any payload without
+	// a kind ("Object 'Kind' is missing in ..."), and drops the message
+	// silently -- leaving the edge node's local ServiceAccount/RBAC cache stale
+	// and pods using that ServiceAccount unable to authenticate against
+	// MetaServer.
+	sendObj.SetGroupVersionKind(policyv1alpha1.SchemeGroupVersion.WithKind(serviceAccountAccessKind))
 	for _, node := range targets {
 		resource, err := messagelayer.BuildResource(node, sendObj.Namespace, model.ResourceTypeSaAccess, sendObj.Name)
 		if err != nil {

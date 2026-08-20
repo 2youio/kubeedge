@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierror "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apiserver/pkg/authentication/user"
@@ -1923,5 +1924,93 @@ func TestSyncRules(t *testing.T) {
 				t.Errorf("TestCase %q Expected status: %v, got: %v", tt.name, tt.output.Status.NodeList, saa.Status.NodeList)
 			}
 		})
+	}
+}
+
+// TestSend2EdgeMessageIsDecodableByImitator asserts that the payload send2Edge
+// puts on the wire can be decoded by edgecore's metaserver imitator, which
+// decodes it into unstructured.Unstructured with
+// unstructured.UnstructuredJSONScheme and silently drops the message when
+// apiVersion/kind are absent (see
+// edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/imitator).
+// The input object deliberately has an empty TypeMeta, the way it comes back
+// from a typed client Get.
+func TestSend2EdgeMessageIsDecodableByImitator(t *testing.T) {
+	cloudHub := &common.ModuleInfo{
+		ModuleName: modules.CloudHubModuleName,
+		ModuleType: common.MsgCtxTypeChannel,
+	}
+	beehiveContext.InitContext([]string{common.MsgCtxTypeChannel})
+	beehiveContext.AddModule(cloudHub)
+
+	acc := &policyv1alpha1.ServiceAccountAccess{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "saa-test",
+			Namespace:       "observability",
+			UID:             types.UID("2fd8b0e4-0000-4000-8000-000000000001"),
+			ResourceVersion: "42",
+		},
+		Spec: policyv1alpha1.AccessSpec{
+			ServiceAccount: v1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "observability"},
+			},
+		},
+		Status: policyv1alpha1.AccessStatus{NodeList: []string{"edge-node-1", "edge-node-2"}},
+	}
+	if acc.APIVersion != "" || acc.Kind != "" {
+		t.Fatalf("test input must have an empty TypeMeta, got %q/%q", acc.APIVersion, acc.Kind)
+	}
+
+	ctr := &Controller{MessageLayer: messagelayer.PolicyControllerMessageLayer()}
+	targets := []string{"edge-node-1", "edge-node-2"}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ctr.send2Edge(acc, targets, model.InsertOperation)
+	}()
+
+	for range targets {
+		message, err := beehiveContext.Receive(modules.CloudHubModuleName)
+		if err != nil {
+			t.Errorf("failed to receive message: %v", err)
+			continue
+		}
+		// Same conversion the imitator does before decoding.
+		bytes, err := json.Marshal(message.GetContent())
+		if err != nil {
+			t.Errorf("failed to marshal message content: %v", err)
+			continue
+		}
+		obj := new(unstructured.Unstructured)
+		if err := runtime.DecodeInto(unstructured.UnstructuredJSONScheme, bytes, obj); err != nil {
+			t.Errorf("message content is not decodable by the imitator: %v, content: %s", err, bytes)
+			continue
+		}
+		if got, want := obj.GetAPIVersion(), policyv1alpha1.SchemeGroupVersion.String(); got != want {
+			t.Errorf("apiVersion got %q, want %q", got, want)
+		}
+		if got, want := obj.GetKind(), "ServiceAccountAccess"; got != want {
+			t.Errorf("kind got %q, want %q", got, want)
+		}
+		if got, want := obj.GetName(), acc.Name; got != want {
+			t.Errorf("name got %q, want %q", got, want)
+		}
+		if got, want := obj.GetNamespace(), acc.Namespace; got != want {
+			t.Errorf("namespace got %q, want %q", got, want)
+		}
+		if got, want := message.GetResourceVersion(), acc.ResourceVersion; got != want {
+			t.Errorf("resourceVersion got %q, want %q", got, want)
+		}
+	}
+	wg.Wait()
+
+	// The caller's object must not be mutated by send2Edge.
+	if acc.APIVersion != "" || acc.Kind != "" {
+		t.Errorf("send2Edge mutated the input object TypeMeta: %q/%q", acc.APIVersion, acc.Kind)
+	}
+	if len(acc.Status.NodeList) != 2 {
+		t.Errorf("send2Edge mutated the input object status.nodeList: %v", acc.Status.NodeList)
 	}
 }
