@@ -410,7 +410,6 @@ func (c *Controller) syncRules(ctx context.Context, acc *policyv1alpha1.ServiceA
 		return controllerruntime.Result{}, nil
 	}
 
-	addNodes := subtractSlice(acc.Status.NodeList, nodes)
 	deleteNodes := subtractSlice(nodes, acc.Status.NodeList)
 	sort.Slice(currentAcc.Spec.AccessRoleBinding, func(i, j int) bool {
 		return currentAcc.Spec.AccessRoleBinding[i].RoleBinding.Name < currentAcc.Spec.AccessRoleBinding[j].RoleBinding.Name
@@ -421,14 +420,6 @@ func (c *Controller) syncRules(ctx context.Context, acc *policyv1alpha1.ServiceA
 	sort.Slice(nodes, func(i, j int) bool {
 		return nodes[i] < nodes[j]
 	})
-	if !equality.Semantic.DeepEqual(acc.Status.NodeList, nodes) {
-		acc.Status.NodeList = append([]string{}, nodes...)
-		if err := c.Client.Status().Update(ctx, acc); err != nil {
-			klog.Errorf("failed to update serviceaccountaccess status %s/%s, %v", acc.Namespace, acc.Name, err)
-			return controllerruntime.Result{Requeue: true}, err
-		}
-		klog.V(4).Infof("update serviceaccountaccess %s/%s status.nodeList %v", acc.Namespace, acc.Name, nodes)
-	}
 	if !equalAccessBindingSlice(acc.Spec.AccessClusterRoleBinding, currentAcc.Spec.AccessClusterRoleBinding) ||
 		!equalAccessBindingSlice(acc.Spec.AccessRoleBinding, currentAcc.Spec.AccessRoleBinding) ||
 		!equalServiceAccount(&acc.Spec.ServiceAccount, &currentAcc.Spec.ServiceAccount) ||
@@ -442,12 +433,26 @@ func (c *Controller) syncRules(ctx context.Context, acc *policyv1alpha1.ServiceA
 		c.send2Edge(acc, nodes, model.UpdateOperation)
 	} else {
 		klog.V(4).Infof("serviceaccountaccess spec %s/%s is up to date", acc.Namespace, acc.Name)
-		if len(addNodes) != 0 {
-			c.send2Edge(acc, addNodes, model.InsertOperation)
-		}
+		// Send to every node, not only the ones missing from status.NodeList.
+		// cloudHub drops a message whose resourceVersion is not newer than the
+		// one recorded in that node's ObjectSync, so a node already in sync
+		// costs nothing on the wire, while a node that silently missed an
+		// earlier send is repaired instead of being stranded forever.
+		c.send2Edge(acc, nodes, model.UpdateOperation)
 	}
 	if len(deleteNodes) != 0 {
 		c.send2Edge(acc, deleteNodes, model.DeleteOperation)
+	}
+	// Record the node list only after the sends. A node written into
+	// status.NodeList but never sent to used to be unreachable afterwards,
+	// because the send list was derived from that same list on every later pass.
+	if !equality.Semantic.DeepEqual(acc.Status.NodeList, nodes) {
+		acc.Status.NodeList = append([]string{}, nodes...)
+		if err := c.Client.Status().Update(ctx, acc); err != nil {
+			klog.Errorf("failed to update serviceaccountaccess status %s/%s, %v", acc.Namespace, acc.Name, err)
+			return controllerruntime.Result{Requeue: true}, err
+		}
+		klog.V(4).Infof("update serviceaccountaccess %s/%s status.nodeList %v", acc.Namespace, acc.Name, nodes)
 	}
 	return controllerruntime.Result{}, nil
 }
