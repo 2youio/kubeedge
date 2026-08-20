@@ -1787,7 +1787,7 @@ func TestSyncRules(t *testing.T) {
 				},
 				Status: policyv1alpha1.AccessStatus{NodeList: []string{"my-node", "my-node-2"}},
 			},
-			msgOpr: []string{model.InsertOperation},
+			msgOpr: []string{model.UpdateOperation, model.UpdateOperation}, // both nodes, not just the added one
 		},
 		{
 			name:  "delete only",
@@ -1803,7 +1803,7 @@ func TestSyncRules(t *testing.T) {
 				},
 				Status: policyv1alpha1.AccessStatus{NodeList: []string{"my-node"}},
 			},
-			msgOpr: []string{model.DeleteOperation},
+			msgOpr: []string{model.UpdateOperation, model.DeleteOperation}, // the remaining node is refreshed too
 		},
 		{
 			name:  "insert/delete only",
@@ -1819,7 +1819,7 @@ func TestSyncRules(t *testing.T) {
 				},
 				Status: policyv1alpha1.AccessStatus{NodeList: []string{"my-node"}},
 			},
-			msgOpr: []string{model.InsertOperation, model.DeleteOperation},
+			msgOpr: []string{model.UpdateOperation, model.DeleteOperation}, // the added node gets an update, not an insert
 		},
 		{
 			name:  "reconcile failed cause serviceaccountaccess not found",
