@@ -51,7 +51,7 @@ func (sctl *SyncController) reconcileObjectSync(sync *v1alpha1.ObjectSync) {
 	ret, err := lister.ByNamespace(sync.Namespace).Get(sync.Spec.ObjectName)
 
 	if apierrors.IsNotFound(err) {
-		sctl.gcOrphanedObjectSync(sync)
+		sctl.gcOrphanedObjectSync(sync, apiVersion, kind)
 		return
 	} else if err != nil || ret == nil {
 		klog.Errorf("failed to get obj(gvr:%v,namespace:%v,name:%v), %v", gvr, sync.Namespace, sync.Spec.ObjectName, err)
@@ -65,7 +65,7 @@ func (sctl *SyncController) reconcileObjectSync(sync *v1alpha1.ObjectSync) {
 
 	syncObjUID := getObjectUID(sync.Name)
 	if syncObjUID != string(object.GetUID()) {
-		sctl.gcOrphanedObjectSync(sync)
+		sctl.gcOrphanedObjectSync(sync, apiVersion, kind)
 		return
 	}
 
@@ -77,21 +77,42 @@ func (sctl *SyncController) reconcileObjectSync(sync *v1alpha1.ObjectSync) {
 // message ACK is received by `cloudHub`, the objectSync will be deleted
 // directly in the `cloudHub`. But if message build failed, the objectSync
 // will be deleted directly in the `syncController`.
-func (sctl *SyncController) gcOrphanedObjectSync(sync *v1alpha1.ObjectSync) {
-	resourceType := strings.ToLower(sync.Spec.ObjectKind)
+//
+// apiVersion and kind must be the values already resolved by the caller rather
+// than sync.Spec: the object is gone from K8s, so the message body has to be
+// fabricated here, and the GVK is the one piece of it the edge cannot rebuild on
+// its own. Without it the edge writes the delete to the v1 meta table but its
+// meta_v2 writer rejects the body, leaving the object in meta_v2 forever.
+func (sctl *SyncController) gcOrphanedObjectSync(sync *v1alpha1.ObjectSync, apiVersion, kind string) {
 	nodeName := getNodeName(sync.Name)
+
+	// An empty kind cannot build a message resource, so the objectSync below
+	// would be deleted with the edge never being told. Bail out loudly instead.
+	if kind == "" {
+		klog.Errorf("The ObjectKind is empty in spec of objectsync: %s, cannot notify the edge of the deletion", sync.Name)
+		sctl.deleteObjectSync(sync)
+		return
+	}
+
+	resourceType := strings.ToLower(kind)
 	klog.V(4).Infof("%s: %s has been deleted in K8s, send the delete event to edge in sync loop", resourceType, sync.Spec.ObjectName)
 
 	object := &unstructured.Unstructured{}
+	object.SetAPIVersion(apiVersion)
+	object.SetKind(kind)
 	object.SetNamespace(sync.Namespace)
 	object.SetName(sync.Spec.ObjectName)
 	object.SetUID(types.UID(getObjectUID(sync.Name)))
 	if msg := buildEdgeControllerMessage(nodeName, sync.Namespace, resourceType, sync.Spec.ObjectName, model.DeleteOperation, object); msg != nil {
 		beehiveContext.Send(commonconst.DefaultContextSendModuleName, *msg)
 	} else {
-		if err := sctl.crdclient.ReliablesyncsV1alpha1().ObjectSyncs(sync.Namespace).Delete(context.Background(), sync.Name, *metav1.NewDeleteOptions(0)); err != nil {
-			klog.Errorf("Failed to delete objectsync %s: %v", sync.Name, err)
-		}
+		sctl.deleteObjectSync(sync)
+	}
+}
+
+func (sctl *SyncController) deleteObjectSync(sync *v1alpha1.ObjectSync) {
+	if err := sctl.crdclient.ReliablesyncsV1alpha1().ObjectSyncs(sync.Namespace).Delete(context.Background(), sync.Name, *metav1.NewDeleteOptions(0)); err != nil {
+		klog.Errorf("Failed to delete objectsync %s: %v", sync.Name, err)
 	}
 }
 

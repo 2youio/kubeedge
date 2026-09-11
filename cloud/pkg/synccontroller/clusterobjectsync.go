@@ -94,11 +94,27 @@ func (sctl *SyncController) gcOrphanedClusterObjectSync(sync *v1alpha1.ClusterOb
 // directly in the `cloudHub`. But if message build failed, the ClusterObjectSync
 // will be deleted directly in the `syncController`.
 func (sctl *SyncController) gcOrphanedClusterObjectSyncImpl(sync *v1alpha1.ClusterObjectSync) {
-	resourceType := strings.ToLower(sync.Spec.ObjectKind)
 	nodeName := getNodeNameFunc(sync.Name)
+
+	// An empty kind cannot build a message resource, so the clusterObjectSync
+	// below would be deleted with the edge never being told. Bail out loudly.
+	if sync.Spec.ObjectKind == "" {
+		klog.Errorf("The ObjectKind is empty in spec of clusterObjectSync: %s, cannot notify the edge of the deletion", sync.Name)
+		if err := deleteClusterObjectSyncFunc(sctl, sync.Name); err != nil {
+			klog.Errorf("Failed to delete clusterObjectSync %s: %v", sync.Name, err)
+		}
+		return
+	}
+
+	resourceType := strings.ToLower(sync.Spec.ObjectKind)
 	klog.V(4).Infof("%s: %s has been deleted in K8s, send the delete event to edge in sync loop", resourceType, sync.Spec.ObjectName)
 
+	// The GVK has to be stamped on the fabricated body: the object is gone from
+	// K8s, and the edge cannot rebuild the GVK from the message on its own. See
+	// gcOrphanedObjectSync for why its absence strands the object in meta_v2.
 	object := &unstructured.Unstructured{}
+	object.SetAPIVersion(sync.Spec.ObjectAPIVersion)
+	object.SetKind(sync.Spec.ObjectKind)
 	object.SetName(sync.Spec.ObjectName)
 	object.SetUID(types.UID(getObjectUIDFunc(sync.Name)))
 	if msg := buildEdgeControllerMessageFunc(nodeName, v2.NullNamespace, resourceType, sync.Spec.ObjectName, model.DeleteOperation, object); msg != nil {
