@@ -310,13 +310,17 @@ func (m *metaManager) processResponse(message model.Message) {
 }
 
 func (m *metaManager) processDelete(message model.Message) {
-	imitator.DefaultV2Client.Inject(message)
 	_, resType, _ := parseResource(&message)
 	if resType == model.ResourceTypePod && message.GetSource() == modules.EdgedModuleName {
 		// if pod is deleted in K8s, then a new delete message will be sent to edge
 		sendToCloud(&message)
 		return
 	}
+
+	// Injected only past the edge-initiated return above: that branch deletes
+	// nothing locally, it just forwards the request, so meta_v2 must not drop the
+	// object before the cloud confirms it. Its body is DeleteOptions anyway.
+	imitator.DefaultV2Client.Inject(message)
 
 	if err := m.handleMessage(&message); err != nil {
 		feedbackError(err, message)
