@@ -84,8 +84,17 @@ func (sctl *SyncController) reconcileObjectSync(sync *v1alpha1.ObjectSync) {
 // its own. Without it the edge writes the delete to the v1 meta table but its
 // meta_v2 writer rejects the body, leaving the object in meta_v2 forever.
 func (sctl *SyncController) gcOrphanedObjectSync(sync *v1alpha1.ObjectSync, apiVersion, kind string) {
-	resourceType := strings.ToLower(kind)
 	nodeName := getNodeName(sync.Name)
+
+	// An empty kind cannot build a message resource, so the objectSync below
+	// would be deleted with the edge never being told. Bail out loudly instead.
+	if kind == "" {
+		klog.Errorf("The ObjectKind is empty in spec of objectsync: %s, cannot notify the edge of the deletion", sync.Name)
+		sctl.deleteObjectSync(sync)
+		return
+	}
+
+	resourceType := strings.ToLower(kind)
 	klog.V(4).Infof("%s: %s has been deleted in K8s, send the delete event to edge in sync loop", resourceType, sync.Spec.ObjectName)
 
 	object := &unstructured.Unstructured{}
@@ -97,9 +106,13 @@ func (sctl *SyncController) gcOrphanedObjectSync(sync *v1alpha1.ObjectSync, apiV
 	if msg := buildEdgeControllerMessage(nodeName, sync.Namespace, resourceType, sync.Spec.ObjectName, model.DeleteOperation, object); msg != nil {
 		beehiveContext.Send(commonconst.DefaultContextSendModuleName, *msg)
 	} else {
-		if err := sctl.crdclient.ReliablesyncsV1alpha1().ObjectSyncs(sync.Namespace).Delete(context.Background(), sync.Name, *metav1.NewDeleteOptions(0)); err != nil {
-			klog.Errorf("Failed to delete objectsync %s: %v", sync.Name, err)
-		}
+		sctl.deleteObjectSync(sync)
+	}
+}
+
+func (sctl *SyncController) deleteObjectSync(sync *v1alpha1.ObjectSync) {
+	if err := sctl.crdclient.ReliablesyncsV1alpha1().ObjectSyncs(sync.Namespace).Delete(context.Background(), sync.Name, *metav1.NewDeleteOptions(0)); err != nil {
+		klog.Errorf("Failed to delete objectsync %s: %v", sync.Name, err)
 	}
 }
 

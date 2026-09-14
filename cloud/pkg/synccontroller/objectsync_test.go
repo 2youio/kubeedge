@@ -17,10 +17,12 @@ limitations under the License.
 package synccontroller
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -29,6 +31,7 @@ import (
 	"k8s.io/client-go/dynamic/fake"
 
 	"github.com/kubeedge/api/apis/reliablesyncs/v1alpha1"
+	crdfake "github.com/kubeedge/api/client/clientset/versioned/fake"
 	"github.com/kubeedge/beehive/pkg/common"
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
 	"github.com/kubeedge/beehive/pkg/core/model"
@@ -201,6 +204,25 @@ func TestGCOrphanedObjectSyncStampsGVK(t *testing.T) {
 				t.Errorf("stub unexpectedly carries a spec: %v", obj.Object)
 			}
 		})
+	}
+}
+
+// An empty kind cannot build a message resource, so the edge can never be told
+// about the deletion. The ObjectSync must still be cleaned up rather than left to
+// be retried forever.
+func TestGCOrphanedObjectSyncEmptyKind(t *testing.T) {
+	sync := tf.NewObjectSync(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "1"), "")
+	sync.Spec.ObjectKind = ""
+
+	crdClient := crdfake.NewSimpleClientset(sync)
+	sctl := &SyncController{crdclient: crdClient}
+
+	sctl.gcOrphanedObjectSync(sync, "v1", "")
+
+	_, err := crdClient.ReliablesyncsV1alpha1().ObjectSyncs(sync.Namespace).
+		Get(context.TODO(), sync.Name, v1.GetOptions{})
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("objectsync should have been deleted, got err = %v", err)
 	}
 }
 
