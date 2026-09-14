@@ -22,6 +22,7 @@ import (
 	v2 "github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao/v2"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/imitator/watchhook"
 	"github.com/kubeedge/kubeedge/pkg/metaserver"
+	"github.com/kubeedge/kubeedge/pkg/metaserver/util"
 )
 
 // imitator is a storage based on metav2 that imitate the behavior of etcd
@@ -265,13 +266,25 @@ func (s *imitator) Event(msg *model.Message) []watch.Event {
 	if err != nil {
 		// Edge-originated bodies (DeleteOptions, patches, TypeMeta-less node
 		// objects) never decode and never belonged in meta_v2. Keep them out of
-		// the error log so real failures stand out.
+		// the error log so real failures stand out, and never let them reach the
+		// store lookup below.
 		if msg.GetSource() == modules.EdgedModuleName {
 			klog.V(4).Infof("skip undecodable edge-originated message content: %v", err)
 			return ret
 		}
-		klog.Errorf("failed to unmarshal message content to unstructured obj: %+v", err)
-		return ret
+		// A delete built by synccontroller's orphaned-sync GC carries a fabricated
+		// body with no apiVersion/kind, which this codec rejects. Recover the GVK
+		// from the row already stored for the object, so that an edge running
+		// against a cloudcore that does not stamp it still applies the delete
+		// instead of stranding the object in meta_v2 forever.
+		recovered, rerr := s.recoverDeletedObj(msg, bytes, op)
+		if rerr != nil {
+			klog.Errorf("failed to unmarshal message content to unstructured obj: %+v (gvk recovery: %v)", err, rerr)
+			return ret
+		}
+		klog.V(2).Infof("[metaserver] recovered GVK %s for delete of %s from local storage",
+			recovered.GroupVersionKind(), msg.Router.Resource)
+		obj = recovered
 	}
 	if obj.IsList() {
 		fn := func(object runtime.Object) error {
@@ -291,6 +304,94 @@ func (s *imitator) Event(msg *model.Message) []watch.Event {
 		ret = append(ret, watch.Event{Type: op, Object: obj})
 	}
 	return ret
+}
+
+// recoverDeletedObj resolves a delete whose body carries no GVK into the object
+// already stored for it in meta_v2.
+//
+// synccontroller's orphaned-sync GC cannot send the real object (it is gone from
+// K8s) and older cloudcores stamp no apiVersion/kind on the stub they fabricate,
+// which this codec rejects. The row we hold is both the missing GVK and the last
+// known state of the object, so the stored object is returned as the delete
+// event: watchers then see a normal deletion instead of nothing at all.
+//
+// Only deletes are recovered; every other operation carries a real object whose
+// GVK the edgecontroller has already stamped via util.SetMetaType. The result is
+// accepted only if it addresses exactly the row that was matched, so a bad match
+// is a no-op rather than a delete of some other object.
+func (s *imitator) recoverDeletedObj(msg *model.Message, body []byte, op watch.EventType) (*unstructured.Unstructured, error) {
+	if op != watch.Deleted {
+		return nil, fmt.Errorf("operation %q is not a delete", msg.Router.Operation)
+	}
+
+	var stub struct {
+		Metadata struct {
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+			UID       string `json:"uid"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(body, &stub); err != nil {
+		return nil, err
+	}
+	if stub.Metadata.Name == "" {
+		return nil, fmt.Errorf("message content carries no metadata.name")
+	}
+
+	_, resType, _ := parseResource(msg.Router.Resource)
+	if resType == "" {
+		return nil, fmt.Errorf("no resource type in message resource %q", msg.Router.Resource)
+	}
+
+	namespace := stub.Metadata.Namespace
+	if namespace == v2.NullNamespace {
+		namespace = ""
+	}
+	rows, err := v2.RawMetaByNN(namespace, stub.Metadata.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	// The message resource type is the lower-cased kind, so compare against the
+	// kind implied by each stored row rather than pluralising resType: that
+	// direction is lossy for names such as serviceaccountaccess.
+	var matched *v2.MetaV2
+	for i := range *rows {
+		row := &(*rows)[i]
+		gvr, _, _ := metaserver.ParseKey(row.Key)
+		if gvr.Resource == "" || !strings.EqualFold(util.UnsafeResourceToKind(gvr.Resource), resType) {
+			continue
+		}
+		if matched != nil {
+			return nil, fmt.Errorf("more than one meta_v2 row matches %s/%s type %s, refusing to guess",
+				namespace, stub.Metadata.Name, resType)
+		}
+		matched = row
+	}
+	if matched == nil {
+		return nil, fmt.Errorf("no meta_v2 row for %s/%s type %s", namespace, stub.Metadata.Name, resType)
+	}
+
+	stored := new(unstructured.Unstructured)
+	if err := runtime.DecodeInto(s.codec, []byte(matched.Value), stored); err != nil {
+		return nil, fmt.Errorf("stored row %s does not decode: %v", matched.Key, err)
+	}
+
+	// Same guard the v1 path applies when it deletes by key and UID: never drop a
+	// row that belongs to a different incarnation of the same name.
+	if storedUID := string(stored.GetUID()); stub.Metadata.UID != "" && storedUID != "" && storedUID != stub.Metadata.UID {
+		return nil, fmt.Errorf("uid mismatch for %s: message has %s, stored row has %s",
+			matched.Key, stub.Metadata.UID, storedUID)
+	}
+
+	key, err := metaserver.KeyFuncObj(stored)
+	if err != nil {
+		return nil, err
+	}
+	if key != matched.Key {
+		return nil, fmt.Errorf("stored object addresses key %q, not the matched row %q", key, matched.Key)
+	}
+	return stored, nil
 }
 
 // Resource format: <namespace>/<restype>[/resid]

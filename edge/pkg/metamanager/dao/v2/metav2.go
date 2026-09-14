@@ -80,6 +80,24 @@ func RawMetaByGVRNN(gvr schema.GroupVersionResource, namespace string, name stri
 	return objs, nil
 }
 
+// RawMetaByNN lists raw data by Namespace and Name only. Used when the
+// group/version/resource of an object is not known up front and has to be
+// recovered from what is already stored.
+func RawMetaByNN(namespace string, name string) (*[]MetaV2, error) {
+	objs := new([]MetaV2)
+	var err error
+	switch namespace {
+	case NullNamespace, "":
+		_, err = dbm.DBAccess.QueryTable(NewMetaTableName).Filter(NAME, name).All(objs)
+	default:
+		_, err = dbm.DBAccess.QueryTable(NewMetaTableName).Filter(NS, namespace).Filter(NAME, name).All(objs)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return objs, nil
+}
+
 func getCondition(gvr schema.GroupVersionResource, namespace string, name string) *orm.Condition {
 	cond := orm.NewCondition()
 	cond.And(GVR, gvr.String())

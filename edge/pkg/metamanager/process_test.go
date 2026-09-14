@@ -560,6 +560,11 @@ func TestProcessDelete(t *testing.T) {
 	deleteRes.EXPECT().RowsAffected().Return(int64(0), nil).Times(1)
 	rawSetterMock.EXPECT().Exec().Return(deleteRes, nil).Times(1)
 	ormerMock.EXPECT().Raw(gomock.Any(), gomock.Any()).Return(rawSetterMock).Times(1)
+	// the body carries no TypeMeta, so the imitator looks the object up in
+	// meta_v2 to recover its GVK; no namespace means a filter on Name only
+	ormerMock.EXPECT().QueryTable(gomock.Any()).Return(querySetterMock).Times(1)
+	querySetterMock.EXPECT().Filter(gomock.Any(), gomock.Any()).Return(querySetterMock).Times(1)
+	querySetterMock.EXPECT().All(gomock.Any()).Return(int64(0), nil).Times(1)
 	msg = model.NewMessage("").BuildRouter(ModuleNameEdgeHub, GroupResource, "test/"+model.ResourceTypePod, model.DeleteOperation).FillBody(msgPod)
 	meta.processDelete(*msg)
 	message, _ = beehiveContext.Receive(ModuleNameEdgeHub)
@@ -648,9 +653,13 @@ func TestProcessDelete_SuccessDeletePodToEdged(t *testing.T) {
 	deleteRes.EXPECT().RowsAffected().Return(int64(1), nil).Times(1)
 	rawSetterMock.EXPECT().Exec().Return(deleteRes, nil).Times(1)
 	ormerMock.EXPECT().Raw(gomock.Any(), gomock.Any()).Return(rawSetterMock).Times(1)
-	querySetterMock.EXPECT().Filter(gomock.Any(), gomock.Any()).Return(querySetterMock).Times(1)
 	querySetterMock.EXPECT().Delete().Return(int64(1), nil).Times(1)
-	ormerMock.EXPECT().QueryTable(gomock.Any()).Return(querySetterMock).Times(1)
+	// one QueryTable for the podpatch delete, one for the imitator's GVK
+	// recovery lookup: the body carries no TypeMeta. The recovery filters on
+	// both Namespace and Name, the podpatch delete on Key.
+	ormerMock.EXPECT().QueryTable(gomock.Any()).Return(querySetterMock).Times(2)
+	querySetterMock.EXPECT().Filter(gomock.Any(), gomock.Any()).Return(querySetterMock).Times(3)
+	querySetterMock.EXPECT().All(gomock.Any()).Return(int64(0), nil).Times(1)
 
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
