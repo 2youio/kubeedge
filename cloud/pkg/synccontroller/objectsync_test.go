@@ -117,10 +117,14 @@ func TestGCOrphanedObjectSync(t *testing.T) {
 		name             string
 		ExpectedResource string
 		ObjectSyncs      *v1alpha1.ObjectSync
+		apiVersion       string
+		kind             string
 	}{
 		{
 			name:             "test gcOrphanedObjectSyncs",
 			ObjectSyncs:      tf.NewObjectSync(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "1"), "Pod"),
+			apiVersion:       "v1",
+			kind:             "Pod",
 			ExpectedResource: resource,
 		},
 	}
@@ -136,10 +140,65 @@ func TestGCOrphanedObjectSync(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			testController := newSyncController(true)
-			go testController.gcOrphanedObjectSync(tt.ObjectSyncs)
+			go testController.gcOrphanedObjectSync(tt.ObjectSyncs, tt.apiVersion, tt.kind)
 			message, _ := beehiveContext.Receive(modules.CloudHubModuleName)
 			if !reflect.DeepEqual(message.GetResource(), tt.ExpectedResource) {
 				t.Errorf("gcOrphanedObjectSync() = %v, want %v", message.GetResource(), tt.ExpectedResource)
+			}
+		})
+	}
+}
+
+// The fabricated delete body must carry the GVK. Without it the edge's meta_v2
+// writer rejects the message and the object is stranded there permanently, while
+// the v1 meta table and the cloud both go clean.
+func TestGCOrphanedObjectSyncStampsGVK(t *testing.T) {
+	cloudHub := &common.ModuleInfo{
+		ModuleName: modules.CloudHubModuleName,
+		ModuleType: common.MsgCtxTypeChannel,
+	}
+	beehiveContext.InitContext([]string{common.MsgCtxTypeChannel})
+	beehiveContext.AddModule(cloudHub)
+	beehiveContext.AddModuleGroup(modules.CloudHubModuleName, modules.CloudHubModuleGroup)
+	client.DefaultGetRestMapper = func() (mapper meta.RESTMapper, err error) { return nil, nil }
+
+	tests := []struct {
+		name       string
+		apiVersion string
+		kind       string
+	}{
+		{name: "core group object", apiVersion: "v1", kind: "Pod"},
+		{name: "crd object", apiVersion: "policy.kubeedge.io/v1alpha1", kind: "ServiceAccountAccess"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sync := tf.NewObjectSync(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "1"), tt.kind)
+			testController := newSyncController(true)
+			go testController.gcOrphanedObjectSync(sync, tt.apiVersion, tt.kind)
+			message, _ := beehiveContext.Receive(modules.CloudHubModuleName)
+
+			obj, ok := message.GetContent().(*unstructured.Unstructured)
+			if !ok {
+				t.Fatalf("message content is %T, want *unstructured.Unstructured", message.GetContent())
+			}
+			if got := obj.GetAPIVersion(); got != tt.apiVersion {
+				t.Errorf("apiVersion = %q, want %q", got, tt.apiVersion)
+			}
+			if got := obj.GetKind(); got != tt.kind {
+				t.Errorf("kind = %q, want %q", got, tt.kind)
+			}
+			// the parts that already worked must keep working
+			if got := obj.GetName(); got != tf.TestPodName {
+				t.Errorf("name = %q, want %q", got, tf.TestPodName)
+			}
+			if got := string(obj.GetUID()); got != tf.TestPodUID {
+				t.Errorf("uid = %q, want %q", got, tf.TestPodUID)
+			}
+			// a GVK-carrying body must still produce an empty PodSpec, which is
+			// what makes edged fall back to a full re-list
+			if _, found, _ := unstructured.NestedMap(obj.Object, "spec"); found {
+				t.Errorf("stub unexpectedly carries a spec: %v", obj.Object)
 			}
 		})
 	}
