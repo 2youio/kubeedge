@@ -263,6 +263,13 @@ func (s *imitator) Event(msg *model.Message) []watch.Event {
 	obj := new(unstructured.Unstructured)
 	err = runtime.DecodeInto(s.codec, bytes, obj)
 	if err != nil {
+		// Edge-originated bodies (DeleteOptions, patches, TypeMeta-less node
+		// objects) never decode and never belonged in meta_v2. Keep them out of
+		// the error log so real failures stand out.
+		if msg.GetSource() == modules.EdgedModuleName {
+			klog.V(4).Infof("skip undecodable edge-originated message content: %v", err)
+			return ret
+		}
 		klog.Errorf("failed to unmarshal message content to unstructured obj: %+v", err)
 		return ret
 	}
