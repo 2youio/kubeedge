@@ -791,7 +791,7 @@ func TestGetServiceAccountToken(t *testing.T) {
 		},
 	}
 
-	patches.ApplyFunc(getTokenLocally, func(n, ns string, t *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+	patches.ApplyFunc(newestCachedGeneration, func(n, ns string, t *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 		assert.Equal(name, n)
 		assert.Equal(namespace, ns)
 		assert.Equal(tr, t)
@@ -804,7 +804,7 @@ func TestGetServiceAccountToken(t *testing.T) {
 
 	// Test remote token fetching
 	patches.Reset()
-	patches.ApplyFunc(getTokenLocally, func(n, ns string, t *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+	patches.ApplyFunc(newestCachedGeneration, func(n, ns string, t *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 		return nil, errors.New("local token not found")
 	})
 
@@ -834,7 +834,7 @@ func TestGetServiceAccountToken(t *testing.T) {
 	assert.Equal("remote-token", result.Status.Token)
 
 	patches.Reset()
-	patches.ApplyFunc(getTokenLocally, func(n, ns string, t *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+	patches.ApplyFunc(newestCachedGeneration, func(n, ns string, t *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 		return nil, errors.New("local token not found")
 	})
 
