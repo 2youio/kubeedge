@@ -58,7 +58,9 @@ func Trigger(e watch.Event) {
 		if hook.GetName() != "" {
 			compName = hook.GetName() == name
 		}
-		if hook.GetResourceVersion() != 0 {
+		// DELETED skips the resourceVersion check: its object may be an RV-less stub or the
+		// stored last state, and client-go ignores a DELETED for an object it never listed.
+		if hook.GetResourceVersion() != 0 && e.Type != watch.Deleted {
 			accessor, err := meta.Accessor(e.Object)
 			if err != nil {
 				klog.Errorf("failed to get accessor, %v", err)
