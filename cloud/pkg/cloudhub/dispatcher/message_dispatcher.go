@@ -24,6 +24,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/api/apis/reliablesyncs/v1alpha1"
@@ -255,6 +256,10 @@ func (md *messageDispatcher) enqueueAckMessage(nodeID string, msg *beehivemodel.
 	// If the message operation is response, force to sync the resource message,
 	// since the edgeCore requests it.
 	if isDeleteMessage(msg) || msg.GetOperation() == beehivemodel.ResponseOperation {
+		if pending := pendingDeleteForStub(nodeStore, messageKey, msg); pending != nil {
+			klog.V(4).Infof("drop delete stub %s for node %s: delete %s for the same object is pending", msg.GetID(), nodeID, pending.GetID())
+			return
+		}
 		shouldEnqueue = true
 		return
 	}
@@ -412,6 +417,24 @@ func (md *messageDispatcher) enqueueNamespacedResource(nodeID string, msg *beehi
 	}
 
 	return false
+}
+
+// pendingDeleteForStub returns the real DELETE in store that msg must not replace, when msg
+// is synccontroller's orphan-GC stub: a DELETE without resourceVersion, whose body has
+// no labels or spec, so the edge cannot hand it on to watch clients like the real one.
+func pendingDeleteForStub(store cache.Store, key string, msg *beehivemodel.Message) *beehivemodel.Message {
+	if msg.GetOperation() != beehivemodel.DeleteOperation || msg.GetResourceVersion() != "" {
+		return nil
+	}
+	item, exist, _ := store.GetByKey(key)
+	if !exist {
+		return nil
+	}
+	inStore := item.(*beehivemodel.Message)
+	if inStore.GetOperation() != beehivemodel.DeleteOperation || inStore.GetResourceVersion() == "" {
+		return nil
+	}
+	return inStore
 }
 
 func isDeleteMessage(msg *beehivemodel.Message) bool {
