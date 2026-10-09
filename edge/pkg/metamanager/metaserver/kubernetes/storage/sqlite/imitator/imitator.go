@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -46,6 +47,10 @@ func (s *imitator) Inject(msg model.Message) {
 		case watch.Added, watch.Modified:
 			err = s.InsertOrUpdateObj(context.TODO(), e.Object)
 		case watch.Deleted:
+			var skip bool
+			if e.Object, skip = s.deletedObject(e.Object); skip {
+				continue
+			}
 			err = s.DeleteObj(context.TODO(), e.Object)
 		}
 		if err != nil {
@@ -56,6 +61,37 @@ func (s *imitator) Inject(msg model.Message) {
 		// TODO: move Trigger inside InsertOrUpdateObj and DeleteObj
 		watchhook.Trigger(e)
 	}
+}
+
+// deletedObject returns the object a DELETED event should carry: the stored one when obj is
+// cloud's orphan-GC stub (no resourceVersion, no labels or spec), as the apiserver sends
+// the last state. skip is true when the stored row is another object under the same key.
+func (s *imitator) deletedObject(obj runtime.Object) (_ runtime.Object, skip bool) {
+	accessor, err := meta.Accessor(obj)
+	if err != nil {
+		return obj, false
+	}
+	key, err := metaserver.KeyFuncObj(obj)
+	if err != nil {
+		return obj, false
+	}
+	resp, err := s.Get(context.TODO(), key)
+	if err != nil {
+		return obj, false
+	}
+	stored := new(unstructured.Unstructured)
+	if err := runtime.DecodeInto(s.codec, []byte((*resp.Kvs)[0].Value), stored); err != nil {
+		klog.Errorf("failed to decode stored obj %s: %v", key, err)
+		return obj, false
+	}
+	if accessor.GetUID() != "" && stored.GetUID() != "" && accessor.GetUID() != stored.GetUID() {
+		klog.V(2).Infof("[metaserver] skip delete of %s: uid %s, stored uid %s", key, accessor.GetUID(), stored.GetUID())
+		return obj, true
+	}
+	if accessor.GetResourceVersion() != "" {
+		return obj, false
+	}
+	return stored, false
 }
 
 // TODO: filter out insert or update req that the obj's rev is smaller than the stored
