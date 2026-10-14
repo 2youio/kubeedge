@@ -77,7 +77,8 @@ func Trigger(e watch.Event, checkRV bool) {
 				klog.Errorf("failed to parse resource version, %v", err)
 				return
 			}
-			compRev = hook.GetResourceVersion() < rev
+			// the watcher registers at the listed revision+1, the first one it has not sent
+			compRev = hook.GetResourceVersion() <= rev
 		}
 		if compGVR && compNS && compName && compRev {
 			err = hook.Do(e)

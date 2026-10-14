@@ -37,6 +37,7 @@ func TestTriggerResourceVersion(t *testing.T) {
 	}{
 		{"modified above the watch revision", watch.Modified, "150", true, true},
 		{"modified below the watch revision", watch.Modified, "50", true, false},
+		{"modified at the watch revision", watch.Modified, "100", true, true},
 		{"deleted above the watch revision", watch.Deleted, "150", true, true},
 		{"deleted below the watch revision", watch.Deleted, "50", true, false},
 		{"deleted without resourceVersion (from synccontroller.gcOrphanedObjectSync, late)", watch.Deleted, "", true, false},
