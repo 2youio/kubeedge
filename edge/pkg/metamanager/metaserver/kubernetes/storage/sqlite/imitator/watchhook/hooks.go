@@ -47,6 +47,13 @@ func Trigger(e watch.Event, checkRV bool) {
 		return
 	}
 	gvr, ns, name := metaserver.ParseKey(key)
+	var rev uint64
+	var revErr error
+	if checkRV {
+		if rev, revErr = eventResourceVersion(e); revErr != nil {
+			klog.Errorf("failed to get resource version of %s, %v", key, revErr)
+		}
+	}
 	// Copy the hooks, because Do must not run under hooksLock: Stop takes the hook's
 	// lock and then hooksLock.
 	hooksLock.Lock()
@@ -67,25 +74,21 @@ func Trigger(e watch.Event, checkRV bool) {
 			compName = hook.GetName() == name
 		}
 		if checkRV && hook.GetResourceVersion() != 0 {
-			accessor, err := meta.Accessor(e.Object)
-			if err != nil {
-				klog.Errorf("failed to get accessor, %v", err)
-				return
-			}
-			rev, err := storage.APIObjectVersioner{}.ParseResourceVersion(accessor.GetResourceVersion())
-			if err != nil {
-				klog.Errorf("failed to parse resource version, %v", err)
-				return
-			}
 			// the watcher registers at the listed revision+1, the first one it has not sent
-			compRev = hook.GetResourceVersion() <= rev
+			compRev = revErr == nil && hook.GetResourceVersion() <= rev
 		}
 		if compGVR && compNS && compName && compRev {
-			err = hook.Do(e)
-			if err != nil {
+			if err := hook.Do(e); err != nil {
 				klog.Errorf("failed to operate event, %v", err)
-				return
 			}
 		}
 	}
+}
+
+func eventResourceVersion(e watch.Event) (uint64, error) {
+	accessor, err := meta.Accessor(e.Object)
+	if err != nil {
+		return 0, err
+	}
+	return storage.APIObjectVersioner{}.ParseResourceVersion(accessor.GetResourceVersion())
 }
