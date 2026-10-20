@@ -59,6 +59,19 @@ func DeleteMetaByKeyAndPodUID(key, podUID string) (int64, error) {
 	return res.RowsAffected()
 }
 
+// DeleteMetaByKeyAndUID deletes the row under key unless its object has a UID other than uid,
+// so a DELETE for an old object keeps one recreated under the same name.
+func DeleteMetaByKeyAndUID(key, uid string) (int64, error) {
+	res, err := dbm.DBAccess.Raw("DELETE FROM meta WHERE key = ? AND "+
+		"coalesce(CASE WHEN json_valid(value) THEN json_extract(value, '$.metadata.uid') END, ?) = ?",
+		key, uid, uid).Exec()
+	if err != nil {
+		klog.Errorf("delete meta by key %s and uid %s failed, err: %v", key, uid, err)
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // UpdateMeta update meta
 func UpdateMeta(meta *Meta) error {
 	num, err := dbm.DBAccess.Update(meta) // will update all field
