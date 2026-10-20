@@ -72,7 +72,7 @@ func (s *imitator) Inject(msg model.Message) {
 			klog.Errorf("failed to serve event {type:%v,key:%v}: %v", e.Type, key, err)
 			continue
 		}
-		// TODO: move Trigger inside InsertOrUpdateObj and DeleteObj
+		// TODO: move Trigger inside InsertOrUpdateObj and deleteStored
 		watchhook.Trigger(e, checkRV)
 	}
 }
@@ -232,13 +232,6 @@ func (s *imitator) GetPassThroughObj(_ context.Context, key string) ([]byte, err
 	}
 }
 
-func (s *imitator) Delete(_ context.Context, key string) error {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-	s.deleteKey(key)
-	return nil
-}
-
 // deleteKey deletes the row under key. The caller holds s.lock.
 func (s *imitator) deleteKey(key string) {
 	m := v2.MetaV2{
@@ -247,14 +240,6 @@ func (s *imitator) deleteKey(key string) {
 	if _, err := dbm.DBAccess.Delete(&m); err != nil {
 		klog.Errorf("[imitator] delete error: %v", err)
 	}
-}
-func (s *imitator) DeleteObj(_ context.Context, obj runtime.Object) error {
-	key, err := metaserver.KeyFuncObj(obj)
-	if err != nil {
-		return err
-	}
-	err = s.Delete(context.TODO(), key)
-	return err
 }
 func (s *imitator) Get(_ context.Context, key string) (Resp, error) {
 	var resp Resp
