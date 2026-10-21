@@ -19,13 +19,24 @@ package defaultmaster
 import (
 	"testing"
 
+	dynamicfilter "github.com/kubeedge/kubeedge/cloud/pkg/dynamiccontroller/filter"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	discovery "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+func endpointSliceToUnstructured(t *testing.T, eps *discovery.EndpointSlice) unstructured.Unstructured {
+	t.Helper()
+	raw, err := runtime.DefaultUnstructuredConverter.ToUnstructured(eps)
+	require.NoError(t, err)
+	obj := unstructured.Unstructured{Object: raw}
+	obj.SetGroupVersionKind(discovery.SchemeGroupVersion.WithKind(resourceName))
+	return obj
+}
 
 func TestNewDefaultMasterFilter(t *testing.T) {
 	assert := assert.New(t)
@@ -41,17 +52,34 @@ func TestNeedFilter(t *testing.T) {
 	assert := assert.New(t)
 	filter := newDefaultMasterFilter()
 
-	// Case 1: UnstructuredList with EndpointSlice objects
+	// Case 1: UnstructuredList with the default master EndpointSlice
 	objList := &unstructured.UnstructuredList{
 		Items: []unstructured.Unstructured{
 			{
 				Object: map[string]interface{}{
 					"kind": "EndpointSlice",
+					"metadata": map[string]interface{}{
+						"name":      defaultEndpointSliceName,
+						"namespace": defaultEndpointSliceNameSpace,
+					},
 				},
 			},
 		},
 	}
 	assert.True(filter.NeedFilter(objList))
+
+	applicationObjList := &unstructured.UnstructuredList{
+		Items: []unstructured.Unstructured{{
+			Object: map[string]interface{}{
+				"kind": "EndpointSlice",
+				"metadata": map[string]interface{}{
+					"name":      "application",
+					"namespace": defaultEndpointSliceNameSpace,
+				},
+			},
+		}},
+	}
+	assert.False(filter.NeedFilter(applicationObjList))
 
 	// Case 2: Unstructured with matching EndpointSlice object
 	obj := &unstructured.Unstructured{
@@ -125,4 +153,120 @@ func TestFilterResource(t *testing.T) {
 	assert.Equal(defaultMetaServerIP, filteredEndpointSlice.Endpoints[0].Addresses[0])
 	assert.Equal(int32(defaultMetaServerPort), *filteredEndpointSlice.Ports[0].Port)
 	assert.Equal(defaultEndpointSlicePortName, *filteredEndpointSlice.Ports[0].Name)
+}
+
+func TestMessageFilterOnlyRewritesDefaultMasterEndpointSlice(t *testing.T) {
+	unrelated := &discovery.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "application",
+			Namespace: defaultEndpointSliceNameSpace,
+		},
+		Endpoints: []discovery.Endpoint{{Addresses: []string{"192.168.1.1"}}},
+		Ports: []discovery.EndpointPort{{
+			Name: func(s string) *string { return &s }(defaultEndpointSlicePortName),
+			Port: func(i int32) *int32 { return &i }(8080),
+		}},
+	}
+	defaultMaster := &discovery.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      defaultEndpointSliceName,
+			Namespace: defaultEndpointSliceNameSpace,
+		},
+		Endpoints: []discovery.Endpoint{{Addresses: []string{"192.168.1.2"}}},
+		Ports: []discovery.EndpointPort{{
+			Name: func(s string) *string { return &s }(defaultEndpointSlicePortName),
+			Port: func(i int32) *int32 { return &i }(8080),
+		}},
+	}
+	list := &unstructured.UnstructuredList{
+		Items: []unstructured.Unstructured{
+			endpointSliceToUnstructured(t, unrelated),
+			endpointSliceToUnstructured(t, defaultMaster),
+		},
+	}
+
+	unrelatedBefore := list.Items[0].DeepCopy()
+	oldFilter, hadOldFilter := dynamicfilter.GetFilters()[filterName]
+	t.Cleanup(func() {
+		filters := dynamicfilter.GetFilters()
+		if hadOldFilter {
+			filters[filterName] = oldFilter
+			return
+		}
+		delete(filters, filterName)
+	})
+	dynamicfilter.Register(newDefaultMasterFilter())
+	dynamicfilter.MessageFilter(list, "edge-node")
+	assert.Equal(t, unrelatedBefore.Object, list.Items[0].Object)
+
+	var filtered discovery.EndpointSlice
+	err := runtime.DefaultUnstructuredConverter.FromUnstructured(list.Items[1].Object, &filtered)
+	require.NoError(t, err)
+	require.Len(t, filtered.Endpoints, 1)
+	require.Len(t, filtered.Endpoints[0].Addresses, 1)
+	assert.Equal(t, defaultMetaServerIP, filtered.Endpoints[0].Addresses[0])
+	require.Len(t, filtered.Ports, 1)
+	require.NotNil(t, filtered.Ports[0].Port)
+	assert.Equal(t, int32(defaultMetaServerPort), *filtered.Ports[0].Port)
+}
+
+func TestFilterResourceOptionalEndpointPortFields(t *testing.T) {
+	tests := []struct {
+		name      string
+		ports     []discovery.EndpointPort
+		wantPorts []*int32
+	}{
+		{
+			name: "unnamed port is ignored",
+			ports: []discovery.EndpointPort{{
+				Port: func(i int32) *int32 { return &i }(443),
+			}},
+			wantPorts: []*int32{func(i int32) *int32 { return &i }(443)},
+		},
+		{
+			name: "https port without number is rewritten",
+			ports: []discovery.EndpointPort{{
+				Name: func(s string) *string { return &s }(defaultEndpointSlicePortName),
+			}},
+			wantPorts: []*int32{func(i int32) *int32 { return &i }(defaultMetaServerPort)},
+		},
+		{
+			name: "unnamed port does not block https port rewrite",
+			ports: []discovery.EndpointPort{
+				{Port: func(i int32) *int32 { return &i }(443)},
+				{Name: func(s string) *string { return &s }(defaultEndpointSlicePortName)},
+			},
+			wantPorts: []*int32{
+				func(i int32) *int32 { return &i }(443),
+				func(i int32) *int32 { return &i }(defaultMetaServerPort),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			endpointSlice := &discovery.EndpointSlice{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      defaultEndpointSliceName,
+					Namespace: defaultEndpointSliceNameSpace,
+				},
+				Endpoints: []discovery.Endpoint{{Addresses: []string{"192.168.1.1"}}},
+				Ports:     tt.ports,
+			}
+			unstr, err := runtime.DefaultUnstructuredConverter.ToUnstructured(endpointSlice)
+			assert.NoError(t, err)
+			unstructuredObj := &unstructured.Unstructured{Object: unstr}
+			unstructuredObj.SetGroupVersionKind(discovery.SchemeGroupVersion.WithKind(resourceName))
+
+			newDefaultMasterFilter().FilterResource("", unstructuredObj)
+
+			var filteredEndpointSlice discovery.EndpointSlice
+			err = runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &filteredEndpointSlice)
+			assert.NoError(t, err)
+			assert.Equal(t, defaultMetaServerIP, filteredEndpointSlice.Endpoints[0].Addresses[0])
+			for i := range tt.wantPorts {
+				assert.Equal(t, tt.wantPorts[i], filteredEndpointSlice.Ports[i].Port)
+			}
+		})
+	}
 }

@@ -2,10 +2,10 @@ package endpointresource
 
 import (
 	"context"
+	"fmt"
 
 	v1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -21,6 +21,8 @@ import (
 type FilterImpl struct {
 	NodesInformer    *application.CommonResourceEventHandler
 	ServicesInformer *application.CommonResourceEventHandler
+	// defaultTopology applies to Services without a service-topology annotation.
+	defaultTopology string
 }
 
 const (
@@ -29,12 +31,12 @@ const (
 	filterName          = "EndpointResource"
 )
 
-func newEndpointsliceFilter() *FilterImpl {
-	return &FilterImpl{}
+func newEndpointsliceFilter(defaultTopology string) *FilterImpl {
+	return &FilterImpl{defaultTopology: defaultTopology}
 }
 
-func Register() {
-	filter.Register(newEndpointsliceFilter())
+func Register(defaultTopology string) {
+	filter.Register(newEndpointsliceFilter(defaultTopology))
 }
 
 func (f *FilterImpl) Name() string {
@@ -58,7 +60,50 @@ func (f *FilterImpl) NeedFilter(content interface{}) bool {
 	return false
 }
 
-func filterEndpointSlice(targetNode string, obj runtime.Object) {
+// getService resolves the Service owning an endpoint object, preferring the
+// shared informer cache and falling back to a live GET while it is unavailable.
+func getService(namespace, name string) (*v1.Service, error) {
+	servicesGVR := v1.SchemeGroupVersion.WithResource("services")
+
+	var svcRaw runtime.Object
+	lister, err := filter.GetSyncedResourceLister(servicesGVR)
+	if err != nil {
+		klog.Infof("services lister unavailable, falling back to live get: %v", err)
+		svcRaw, err = client.GetDynamicClient().Resource(servicesGVR).Namespace(namespace).
+			Get(context.TODO(), name, metav1.GetOptions{})
+	} else {
+		svcRaw, err = lister.ByNamespace(namespace).Get(name)
+	}
+	if err != nil {
+		return nil, err
+	}
+	switch svc := svcRaw.(type) {
+	case *v1.Service:
+		return svc, nil
+	case *unstructured.Unstructured:
+		var typed v1.Service
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(svc.UnstructuredContent(), &typed); err != nil {
+			return nil, err
+		}
+		return &typed, nil
+	}
+	return nil, fmt.Errorf("unexpected type %T for service %s/%s", svcRaw, namespace, name)
+}
+
+// isScoped reports whether svc's endpoints are scoped to the receiving node's
+// NodeGroup. The annotation wins; without it the default applies, but only to
+// Services with a selector, whose endpoints carry the node they run on.
+func isScoped(svc *v1.Service, defaultTopology string) bool {
+	switch svc.Annotations[nodegroup.ServiceTopologyAnnotation] {
+	case nodegroup.ServiceTopologyRangeNodegroup:
+		return true
+	case nodegroup.ServiceTopologyRangeCluster:
+		return false
+	}
+	return defaultTopology == nodegroup.ServiceTopologyRangeNodegroup && len(svc.Spec.Selector) > 0
+}
+
+func filterEndpointSlice(targetNode string, obj runtime.Object, defaultTopology string) {
 	unstruct, ok := obj.(*unstructured.Unstructured)
 	if !ok {
 		return
@@ -69,26 +114,28 @@ func filterEndpointSlice(targetNode string, obj runtime.Object) {
 		klog.Errorf("convert unstructure content %v err: %v", unstruct.GetName(), err)
 		return
 	}
-	var svcTopology string
+	scoped := false
 	if svcName, ok := epSlice.Labels[discovery.LabelServiceName]; ok {
-		svcRaw, err := filter.GetDynamicResourceInformer(v1.SchemeGroupVersion.WithResource("services")).Lister().ByNamespace(epSlice.Namespace).Get(svcName)
+		svcObj, err := getService(epSlice.Namespace, svcName)
 		if err != nil {
 			klog.Errorf("filter endpoint slice for svc %s error: %v", svcName, err)
 			return
 		}
-		svcObj, err := meta.Accessor(svcRaw)
-		if err != nil {
-			klog.Errorf("get service %v accessor error: %v", svcName, err)
-			return
-		}
-		svcTopology = svcObj.GetAnnotations()[nodegroup.ServiceTopologyAnnotation]
+		scoped = isScoped(svcObj, defaultTopology)
 	}
-	if svcTopology != nodegroup.ServiceTopologyRangeNodegroup {
+	if !scoped {
 		klog.V(4).Infof("skip filter for endpointSlice %v", unstruct.GetName())
 		return
 	}
 	var epsTmp []discovery.Endpoint
 	for _, ep := range epSlice.Endpoints {
+		// An endpoint with no nodeName cannot be shown to be site-local, so it is
+		// dropped rather than dereferenced. This happens routinely during pod
+		// churn, and matches how filterEndpointsAddress treats the same case.
+		if ep.NodeName == nil {
+			klog.V(4).Infof("drop endpoint without nodeName from endpointSlice %v", unstruct.GetName())
+			continue
+		}
 		if filter.IsBelongToSameGroup(targetNode, *ep.NodeName) {
 			epsTmp = append(epsTmp, ep)
 		}
@@ -115,7 +162,7 @@ func filterEndpointsAddress(targetNode string, address []v1.EndpointAddress) []v
 	return tmpAddress
 }
 
-func filterEndpoints(targetNode string, obj runtime.Object) {
+func filterEndpoints(targetNode string, obj runtime.Object, defaultTopology string) {
 	unstruct, ok := obj.(*unstructured.Unstructured)
 	if !ok {
 		return
@@ -127,31 +174,13 @@ func filterEndpoints(targetNode string, obj runtime.Object) {
 		return
 	}
 	svcName := ep.GetName()
-	var svcRaw interface{}
-
-	if !filter.GetDynamicResourceInformer(v1.SchemeGroupVersion.WithResource("services")).Informer().HasSynced() {
-		klog.Info("services informer has not synced yet")
-		svcRaw, err = client.GetDynamicClient().Resource(v1.SchemeGroupVersion.WithResource("services")).Namespace(ep.Namespace).Get(context.TODO(), svcName, metav1.GetOptions{})
-		if err != nil {
-			klog.Errorf("filter endpoint for svc %s error: %v", svcName, err)
-			return
-		}
-	} else {
-		svcRaw, err = filter.GetDynamicResourceInformer(v1.SchemeGroupVersion.WithResource("services")).Lister().
-			ByNamespace(ep.Namespace).Get(svcName)
-		if err != nil {
-			klog.Errorf("filter endpoint for svc %s error: %v", svcName, err)
-			return
-		}
-	}
-
-	svcObj, err := meta.Accessor(svcRaw)
+	svcObj, err := getService(ep.Namespace, svcName)
 	if err != nil {
-		klog.Errorf("get service %v accessor error: %v", svcName, err)
+		klog.Errorf("filter endpoint for svc %s error: %v", svcName, err)
 		return
 	}
 
-	if svcObj.GetAnnotations()[nodegroup.ServiceTopologyAnnotation] != nodegroup.ServiceTopologyRangeNodegroup {
+	if !isScoped(svcObj, defaultTopology) {
 		klog.V(4).Infof("skip filter for endpoint %v", unstruct.GetName())
 		return
 	}
@@ -169,8 +198,8 @@ func filterEndpoints(targetNode string, obj runtime.Object) {
 
 func (f *FilterImpl) FilterResource(targetNode string, obj runtime.Object) {
 	if obj.GetObjectKind().GroupVersionKind().Kind == resourceEpSliceName {
-		filterEndpointSlice(targetNode, obj)
+		filterEndpointSlice(targetNode, obj, f.defaultTopology)
 	} else if obj.GetObjectKind().GroupVersionKind().Kind == resourceEpName {
-		filterEndpoints(targetNode, obj)
+		filterEndpoints(targetNode, obj, f.defaultTopology)
 	}
 }
