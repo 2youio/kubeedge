@@ -18,6 +18,7 @@ package informers
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,6 +55,7 @@ func newTestInformers(stopCh <-chan struct{}, listReactor k8stesting.ReactionFun
 		mapper:                 mapper,
 		customInformers:        make(map[string]cache.SharedIndexInformer),
 		informersByGVR:         make(map[schema.GroupVersionResource]*InformerPair),
+		syncTimedOut:           make(map[schema.GroupVersionResource]struct{}),
 		dynamicInformerFactory: dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynamicClient, 0, v1.NamespaceAll, nil),
 	}
 }
@@ -149,4 +151,47 @@ func TestGetInformerPairSyncTimeout(t *testing.T) {
 	ifs.lock.Lock()
 	defer ifs.lock.Unlock()
 	assert.NotContains(t, ifs.informersByGVR, fooGVR, "an informer that failed to sync must not be cached")
+}
+
+func TestGetInformerPairAfterSyncTimeout(t *testing.T) {
+	origTimeout := informerSyncTimeout
+	informerSyncTimeout = time.Second
+	defer func() { informerSyncTimeout = origTimeout }()
+
+	var allowed atomic.Bool
+	forbiddenUntilAllowed := func(_ k8stesting.Action) (bool, runtime.Object, error) {
+		if allowed.Load() {
+			return false, nil, nil
+		}
+		return true, nil, apierrors.NewForbidden(fooGVR.GroupResource(), "", errors.New("cloudcore cannot list foos"))
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	ifs := newTestInformers(stopCh, forbiddenUntilAllowed)
+
+	_, err := ifs.GetInformerPair(fooGVR)
+	require.ErrorContains(t, err, "failed waiting for "+fooGVR.String()+" Informer to sync")
+
+	// The informer still cannot sync. The second call must fail without waiting again.
+	start := time.Now()
+	informerPair, err := ifs.GetInformerPair(fooGVR)
+	assert.Nil(t, informerPair)
+	assert.ErrorContains(t, err, fooGVR.String()+" Informer has not synced yet")
+	assert.Less(t, time.Since(start), informerSyncTimeout/2, "GetInformerPair waited again for an informer that timed out before")
+
+	// Once cloudcore may list the resource, the informer syncs in the background
+	// and a later call returns it.
+	allowed.Store(true)
+	assert.Eventually(t, func() bool {
+		informerPair, err = ifs.GetInformerPair(fooGVR)
+		return err == nil
+	}, 10*time.Second, 100*time.Millisecond, "GetInformerPair never returned the informer after it could sync")
+	require.NotNil(t, informerPair)
+	assert.True(t, informerPair.Informer.HasSynced())
+
+	ifs.lock.Lock()
+	defer ifs.lock.Unlock()
+	assert.Same(t, informerPair, ifs.informersByGVR[fooGVR])
+	assert.NotContains(t, ifs.syncTimedOut, fooGVR)
 }
