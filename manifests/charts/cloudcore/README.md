@@ -33,6 +33,7 @@ helm upgrade --install cloudcore ./cloudcore --namespace kubeedge --create-names
 - `cloudCore.modules.cloudHub.https.enable`, default `true`.
 - `cloudCore.modules.cloudStream.enable`, default `true`.
 - `cloudCore.modules.dynamicController.enable`,  default `false`.
+- `cloudCore.modules.dynamicController.defaultServiceTopology`, default `""`. Set to `range-nodegroup` to scope the endpoints of every Service with a selector to the receiving edge node's NodeGroup; a Service annotated `apps.kubeedge.io/service-topology: range-cluster` opts out.
 - `cloudCore.modules.router.enable`,  default `false`.
 - `cloudCore.service.type`,  default `NodePort`.
 - `cloudCore.service.cloudhubNodePort`,  default `30000`, which defines the exposed node port for cloudhub service.
