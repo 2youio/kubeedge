@@ -110,7 +110,7 @@ type informers struct {
 	// mapper is the RESTMapper to use for mapping GroupVersionKinds to Resources
 	mapper meta.RESTMapper
 
-	// lock protects to the informersByGVR and customInformers map
+	// lock protects to the informersByGVR, syncTimedOut and customInformers map
 	lock sync.RWMutex
 
 	// customInformers is the cache of informers that support custom filter
@@ -118,6 +118,10 @@ type informers struct {
 
 	// informersByGVR is the cache of informers keyed by GroupVersionResource
 	informersByGVR map[schema.GroupVersionResource]*InformerPair
+
+	// syncTimedOut holds the resources whose informer did not sync within
+	// informerSyncTimeout. Their informers keep syncing in the background.
+	syncTimedOut map[schema.GroupVersionResource]struct{}
 
 	// kubeInformerFactory provides shared informers for built-in resources
 	// in all known API group versions.
@@ -149,6 +153,7 @@ func GetInformersManager() Manager {
 			kubeClient:              client.GetKubeClient(),
 			customInformers:         make(map[string]cache.SharedIndexInformer),
 			informersByGVR:          make(map[schema.GroupVersionResource]*InformerPair),
+			syncTimedOut:            make(map[schema.GroupVersionResource]struct{}),
 			kubeEdgeInformerFactory: edgeinformers.NewSharedInformerFactory(client.GetCRDClient(), 0),
 			kubeInformerFactory:     k8sinformer.NewSharedInformerFactory(client.GetKubeClient(), 0),
 			dynamicInformerFactory:  dynamicinformer.NewFilteredDynamicSharedInformerFactory(client.GetDynamicClient(), 0, v1.NamespaceAll, nil),
@@ -231,6 +236,7 @@ func (ifs *informers) GetInformerPair(gvr schema.GroupVersionResource) (*Informe
 		return informer, nil
 	}
 	genericInformer, err := ifs.forResource(gvr)
+	_, timedOut := ifs.syncTimedOut[gvr]
 	ifs.lock.Unlock()
 	if err != nil {
 		return nil, err
@@ -242,6 +248,12 @@ func (ifs *informers) GetInformerPair(gvr schema.GroupVersionResource) (*Informe
 	}
 
 	if !informerPair.Informer.HasSynced() {
+		// An earlier call already waited for this informer and gave up. Do not wait again:
+		// a resource cloudcore is not allowed to list never syncs, and each wait holds up
+		// the single goroutine that processes Applications from every edge node.
+		if timedOut {
+			return nil, fmt.Errorf("%s Informer has not synced yet", gvr.String())
+		}
 		klog.V(4).Infof("waiting for %s Informer to sync", gvr.String())
 		// Wait for it to sync before returning the Informer so that folks don't read from a stale cache.
 		// The wait is bounded and does not hold ifs.lock, so an informer that can never sync
@@ -249,13 +261,18 @@ func (ifs *informers) GetInformerPair(gvr schema.GroupVersionResource) (*Informe
 		ctx, cancel := context.WithTimeout(wait.ContextForChannel(ifs.stopCh), informerSyncTimeout)
 		defer cancel()
 		if !cache.WaitForCacheSync(ctx.Done(), informerPair.Informer.HasSynced) {
+			ifs.lock.Lock()
+			ifs.syncTimedOut[gvr] = struct{}{}
+			ifs.lock.Unlock()
 			return nil, fmt.Errorf("failed waiting for %s Informer to sync within %v", gvr.String(), informerSyncTimeout)
 		}
 	}
 
-	// Only cache synced informers, so a later call for a resource that failed to sync waits again.
+	// Only cache synced informers. A later call for a resource that failed to sync
+	// returns it once the informer has synced in the background.
 	ifs.lock.Lock()
 	defer ifs.lock.Unlock()
+	delete(ifs.syncTimedOut, gvr)
 	ifs.informersByGVR[gvr] = informerPair
 
 	return informerPair, nil
