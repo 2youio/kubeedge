@@ -285,3 +285,54 @@ func TestRefilterNodeLeavesNodeGroup(t *testing.T) {
 	require.NoError(t, err)
 	waitForAnnotation(filterVersion + "-" + hashNodeGroups([]*v1.Node{testNode("n1", "g1"), testNode("n2", "")}))
 }
+
+// TestRefilterTwoControllersDisagree models two cloudcore instances whose node
+// caches disagree: each sees a different NodeGroup for n2. They must not keep
+// overwriting each other's annotation, because every patch re-sends the object
+// to every edge node that watches it.
+func TestRefilterTwoControllersDisagree(t *testing.T) {
+	t.Skip("known issue: cloudcore instances in an HA setup each run a refilter controller and " +
+		"fight over the annotation while their caches disagree; the fix (leader election) is postponed")
+	client := kubefake.NewSimpleClientset(
+		testNode("n1", "g1"),
+		testNode("n2", "g1"),
+		testService("scoped", nodegroup.ServiceTopologyRangeNodegroup),
+		testSlice("scoped-abc", "scoped", ""))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	factoryA := informers.NewSharedInformerFactory(client, 0)
+	a, err := NewRefilterController(client, factoryA, "")
+	require.NoError(t, err)
+
+	// b shares the Services and EndpointSlices, but reads nodes from a cache
+	// that is behind: n2 is still in g2 there.
+	factoryB := informers.NewSharedInformerFactory(client, 0)
+	b, err := NewRefilterController(client, factoryB, "")
+	require.NoError(t, err)
+	staleFactory := informers.NewSharedInformerFactory(
+		kubefake.NewSimpleClientset(testNode("n1", "g1"), testNode("n2", "g2")), 0)
+	staleNodes := staleFactory.Core().V1().Nodes()
+	b.nodeLister = staleNodes.Lister()
+	b.synced = append(b.synced, staleNodes.Informer().HasSynced)
+
+	factoryA.Start(ctx.Done())
+	factoryB.Start(ctx.Done())
+	staleFactory.Start(ctx.Done())
+	go a.Run(ctx)
+	go b.Run(ctx)
+
+	countPatches := func() int {
+		n := 0
+		for _, action := range client.Actions() {
+			if _, ok := action.(k8stesting.PatchAction); ok {
+				n++
+			}
+		}
+		return n
+	}
+	time.Sleep(3 * time.Second)
+	patches := countPatches()
+	t.Logf("%d patches of one EndpointSlice in 3s", patches)
+	assert.LessOrEqual(t, patches, 2, "the two controllers keep overwriting each other")
+}
