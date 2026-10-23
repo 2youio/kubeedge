@@ -141,8 +141,10 @@ func NewRefilterController(kubeClient kubernetes.Interface, factory informers.Sh
 	if _, err := nodes.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.onNode,
 		UpdateFunc: func(oldObj, newObj interface{}) {
+			// Queue directly: a node that left its NodeGroup has none now,
+			// and onNode would ignore it.
 			if nodeGroupOf(oldObj) != nodeGroupOf(newObj) {
-				c.onNode(newObj)
+				c.queue.Add(nodesKey)
 			}
 		},
 		DeleteFunc: c.onNode,

@@ -249,3 +249,39 @@ func TestRefilterRun(t *testing.T) {
 	_, ok := sliceAnnotation(t, client, "plain-abc")
 	assert.False(t, ok, "a slice of an unscoped Service must never be annotated")
 }
+
+// TestRefilterNodeLeavesNodeGroup: removing a node from its NodeGroup changes
+// what the other nodes of that group may see, so the edge copies must be
+// filtered again.
+func TestRefilterNodeLeavesNodeGroup(t *testing.T) {
+	client := kubefake.NewSimpleClientset(
+		testNode("n1", "g1"),
+		testNode("n2", "g1"),
+		testService("scoped", nodegroup.ServiceTopologyRangeNodegroup),
+		testSlice("scoped-abc", "scoped", ""))
+	factory := informers.NewSharedInformerFactory(client, 0)
+	c, err := NewRefilterController(client, factory, "")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	factory.Start(ctx.Done())
+	go c.Run(ctx)
+
+	waitForAnnotation := func(want string) {
+		t.Helper()
+		var got string
+		err := wait.PollUntilContextTimeout(ctx, 20*time.Millisecond, 3*time.Second, true,
+			func(context.Context) (bool, error) {
+				got, _ = sliceAnnotation(t, client, "scoped-abc")
+				return got == want, nil
+			})
+		require.NoError(t, err, "annotation is %q, want %q", got, want)
+	}
+
+	waitForAnnotation(filterVersion + "-" + hashNodeGroups([]*v1.Node{testNode("n1", "g1"), testNode("n2", "g1")}))
+
+	_, err = client.CoreV1().Nodes().Update(ctx, testNode("n2", ""), metav1.UpdateOptions{})
+	require.NoError(t, err)
+	waitForAnnotation(filterVersion + "-" + hashNodeGroups([]*v1.Node{testNode("n1", "g1"), testNode("n2", "")}))
+}
