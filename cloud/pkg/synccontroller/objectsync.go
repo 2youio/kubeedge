@@ -71,11 +71,16 @@ func (sctl *SyncController) reconcileObjectSync(sync *v1alpha1.ObjectSync) {
 		return
 	}
 
+	// Filter only when the object is due, because filtering is expensive and
+	// most syncs find the edge node up to date.
+	if !needsUpdate(sync, resourceType, object.GetResourceVersion()) {
+		return
+	}
 	var body interface{} = object
 	if filtered := filterForNode(ret, gv.WithKind(kind), nodeName); filtered != nil {
 		body = filtered
 	}
-	sendEvents(nodeName, sync, resourceType, object.GetResourceVersion(), body)
+	sendUpdate(nodeName, sync, resourceType, body)
 }
 
 // filterForNode returns the copy of obj that dynamiccontroller would send to
@@ -139,17 +144,28 @@ func (sctl *SyncController) gcOrphanedObjectSync(sync *v1alpha1.ObjectSync, apiV
 
 func sendEvents(nodeName string, sync *v1alpha1.ObjectSync, resourceType string,
 	objectResourceVersion string, obj interface{}) {
+	if needsUpdate(sync, resourceType, objectResourceVersion) {
+		sendUpdate(nodeName, sync, resourceType, obj)
+	}
+}
+
+// needsUpdate reports whether the object in K8s is newer than the edge node's copy.
+func needsUpdate(sync *v1alpha1.ObjectSync, resourceType, objectResourceVersion string) bool {
 	if sync.Status.ObjectResourceVersion == "" {
 		klog.Errorf("The ObjectResourceVersion is empty in status of objectsync: %s", sync.Name)
-		return
+		return false
 	}
 
 	if CompareResourceVersion(objectResourceVersion, sync.Status.ObjectResourceVersion) > 0 {
-		// trigger the update event
 		klog.V(4).Infof("The resourceVersion: %s of %s in K8s is greater than in edgenode: %s, send the update event", objectResourceVersion, resourceType, sync.Status.ObjectResourceVersion)
-		msg := buildEdgeControllerMessage(nodeName, sync.Namespace, resourceType, sync.Spec.ObjectName, model.UpdateOperation, obj)
-		beehiveContext.Send(commonconst.DefaultContextSendModuleName, *msg)
+		return true
 	}
+	return false
+}
+
+func sendUpdate(nodeName string, sync *v1alpha1.ObjectSync, resourceType string, obj interface{}) {
+	msg := buildEdgeControllerMessage(nodeName, sync.Namespace, resourceType, sync.Spec.ObjectName, model.UpdateOperation, obj)
+	beehiveContext.Send(commonconst.DefaultContextSendModuleName, *msg)
 }
 
 func buildEdgeControllerMessage(nodeName, namespace, resourceType, resourceName, operationType string, obj interface{}) *model.Message {
