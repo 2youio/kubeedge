@@ -31,18 +31,26 @@ import (
 	"github.com/kubeedge/kubeedge/cloud/pkg/controllermanager/nodegroup"
 )
 
-// Edge nodes keep the filtered copies of EndpointSlices and Endpoints that they
-// already have until the object gets a new resourceVersion: cloudhub and
-// edgecore both deliver an object only when its resourceVersion is newer. So
-// when an input of the filter changes, the object must change in the cluster
-// for the edge copies to be filtered again.
+// Edge nodes keep the filtered copies of EndpointSlices that they already have
+// until the slice gets a new resourceVersion: cloudhub and edgecore both
+// deliver an object only when its resourceVersion is newer. So when an input
+// of the filter changes, the slice must change in the cluster for the edge
+// copies to be filtered again.
 //
 // The refilter controller does that. It writes a hash of the filter inputs into
-// an annotation on every object of a scoped Service, and patches the annotation
-// when the hash changes. The patch gives the object a new resourceVersion, so it
-// is sent to every edge node that watches it and filtered again on the way.
-// Because the hash is stored on the object, changes made while cloudcore was
-// down are caught when it starts.
+// an annotation on every EndpointSlice of a scoped Service, and patches the
+// annotation when the hash changes. The patch gives the slice a new
+// resourceVersion, so it is sent to every edge node that watches it and
+// filtered again on the way. Because the hash is stored on the slice, changes
+// made while cloudcore was down are caught when it starts.
+//
+// core/v1 Endpoints are left out on purpose. The filter still filters an
+// Endpoints object each time it is sent, but this controller does not re-send
+// it when the filter inputs change, so an edge copy can stay stale until the
+// object itself changes. The Endpoints API is deprecated as of Kubernetes
+// 1.33: every patch of it logs a deprecation warning, and a wait for its cache
+// would hold up the EndpointSlices too. kube-proxy and CoreDNS read only
+// EndpointSlices.
 //
 // The inputs are:
 //   - whether the Service is scoped (its annotation, the default topology, and
@@ -50,22 +58,22 @@ import (
 //   - the NodeGroup of every node that is in one;
 //   - the filter's behaviour, as filterVersion.
 //
-// An object of a Service that is not scoped is sent unfiltered, so it carries
-// no annotation. Then turning the feature on does not touch every object in the
+// A slice of a Service that is not scoped is sent unfiltered, so it carries no
+// annotation. Then turning the feature on does not touch every slice in the
 // cluster, and an upgrade from a cloudcore that never filtered patches only the
-// objects of scoped Services.
+// slices of scoped Services.
 
 const (
 	// FilterInputsAnnotation holds the hash of the filter inputs that the
-	// object's edge copies were last filtered with.
+	// slice's edge copies were last filtered with.
 	FilterInputsAnnotation = "apps.kubeedge.io/endpoint-filter-inputs"
 
 	// filterVersion is part of the hash. Change it whenever a change to the
 	// filter changes its result for the same inputs, so that the next cloudcore
-	// re-sends every scoped object.
+	// re-sends every scoped slice.
 	filterVersion = "1"
 
-	// Each patch is sent to every edge node that watches the object, and each
+	// Each patch is sent to every edge node that watches the slice, and each
 	// node's acknowledgement costs one ObjectSync status write, so patches are
 	// rate limited.
 	refilterPatchQPS   = 5
@@ -77,7 +85,6 @@ type refilterKind string
 
 const (
 	kindEndpointSlice refilterKind = "EndpointSlice"
-	kindEndpoints     refilterKind = "Endpoints"
 	// kindNodes is the queue item that recomputes the NodeGroup hash.
 	kindNodes refilterKind = "Nodes"
 )
@@ -90,17 +97,16 @@ type refilterKey struct {
 
 var nodesKey = refilterKey{kind: kindNodes}
 
-// RefilterController patches the filter-inputs annotation on EndpointSlices and
-// Endpoints when the inputs of the topology filter change.
+// RefilterController patches the filter-inputs annotation on EndpointSlices
+// when the inputs of the topology filter change.
 type RefilterController struct {
 	kubeClient      kubernetes.Interface
 	defaultTopology string
 
-	nodeLister      corelisters.NodeLister
-	serviceLister   corelisters.ServiceLister
-	sliceLister     discoverylisters.EndpointSliceLister
-	endpointsLister corelisters.EndpointsLister
-	synced          []cache.InformerSynced
+	nodeLister    corelisters.NodeLister
+	serviceLister corelisters.ServiceLister
+	sliceLister   discoverylisters.EndpointSliceLister
+	synced        []cache.InformerSynced
 
 	queue   workqueue.TypedRateLimitingInterface[refilterKey]
 	limiter *rate.Limiter
@@ -117,7 +123,6 @@ func NewRefilterController(kubeClient kubernetes.Interface, factory informers.Sh
 	nodes := factory.Core().V1().Nodes()
 	services := factory.Core().V1().Services()
 	slices := factory.Discovery().V1().EndpointSlices()
-	endpoints := factory.Core().V1().Endpoints()
 
 	c := &RefilterController{
 		kubeClient:      kubeClient,
@@ -125,12 +130,10 @@ func NewRefilterController(kubeClient kubernetes.Interface, factory informers.Sh
 		nodeLister:      nodes.Lister(),
 		serviceLister:   services.Lister(),
 		sliceLister:     slices.Lister(),
-		endpointsLister: endpoints.Lister(),
 		synced: []cache.InformerSynced{
 			nodes.Informer().HasSynced,
 			services.Informer().HasSynced,
 			slices.Informer().HasSynced,
-			endpoints.Informer().HasSynced,
 		},
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.NewTypedItemExponentialFailureRateLimiter[refilterKey](time.Second, 5*time.Minute),
@@ -164,9 +167,6 @@ func NewRefilterController(kubeClient kubernetes.Interface, factory informers.Sh
 		return nil, err
 	}
 	if _, err := slices.Informer().AddEventHandler(objectHandler(c.queue, kindEndpointSlice)); err != nil {
-		return nil, err
-	}
-	if _, err := endpoints.Informer().AddEventHandler(objectHandler(c.queue, kindEndpoints)); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -217,7 +217,6 @@ func (c *RefilterController) enqueueService(namespace, name string) {
 	for _, slice := range slices {
 		c.queue.Add(refilterKey{kind: kindEndpointSlice, namespace: namespace, name: slice.Name})
 	}
-	c.queue.Add(refilterKey{kind: kindEndpoints, namespace: namespace, name: name})
 }
 
 func (c *RefilterController) enqueueAll() {
@@ -228,13 +227,6 @@ func (c *RefilterController) enqueueAll() {
 	for _, slice := range slices {
 		c.queue.Add(refilterKey{kind: kindEndpointSlice, namespace: slice.Namespace, name: slice.Name})
 	}
-	endpoints, err := c.endpointsLister.List(labels.Everything())
-	if err != nil {
-		klog.Errorf("refilter: list Endpoints: %v", err)
-	}
-	for _, ep := range endpoints {
-		c.queue.Add(refilterKey{kind: kindEndpoints, namespace: ep.Namespace, name: ep.Name})
-	}
 }
 
 // Run waits for the caches, then processes the queue until ctx is done.
@@ -242,7 +234,7 @@ func (c *RefilterController) Run(ctx context.Context) {
 	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
-	klog.Info("refilter: waiting for the node, Service, EndpointSlice and Endpoints caches")
+	klog.Info("refilter: waiting for the node, Service and EndpointSlice caches")
 	if !cache.WaitForCacheSync(ctx.Done(), c.synced...) {
 		klog.Error("refilter: caches did not sync, edge copies will not be re-filtered when filter inputs change")
 		return
@@ -312,28 +304,18 @@ func (c *RefilterController) sync(ctx context.Context, key refilterKey) error {
 
 // wantedAnnotation returns the value the filter-inputs annotation should have
 // and the value it has. An empty value means no annotation. skip is true when
-// the object is gone, or its Service is not in the cache yet: the Service's
-// add event will queue the object again.
+// the slice is gone, or its Service is not in the cache yet: the Service's
+// add event will queue the slice again.
 func (c *RefilterController) wantedAnnotation(key refilterKey) (want, current string, skip bool, err error) {
-	var obj metav1.Object
-	var serviceName string
-	switch key.kind {
-	case kindEndpointSlice:
-		slice, err := c.sliceLister.EndpointSlices(key.namespace).Get(key.name)
-		if err != nil {
-			return "", "", apierrors.IsNotFound(err), ignoreNotFound(err)
-		}
-		obj, serviceName = slice, slice.Labels[discovery.LabelServiceName]
-	case kindEndpoints:
-		ep, err := c.endpointsLister.Endpoints(key.namespace).Get(key.name)
-		if err != nil {
-			return "", "", apierrors.IsNotFound(err), ignoreNotFound(err)
-		}
-		obj, serviceName = ep, ep.Name
-	default:
+	if key.kind != kindEndpointSlice {
 		return "", "", true, nil
 	}
-	current = obj.GetAnnotations()[FilterInputsAnnotation]
+	slice, err := c.sliceLister.EndpointSlices(key.namespace).Get(key.name)
+	if err != nil {
+		return "", "", apierrors.IsNotFound(err), ignoreNotFound(err)
+	}
+	current = slice.Annotations[FilterInputsAnnotation]
+	serviceName := slice.Labels[discovery.LabelServiceName]
 
 	// The filter does not scope a slice that names no Service.
 	if serviceName == "" {
@@ -362,18 +344,12 @@ func (c *RefilterController) patch(ctx context.Context, key refilterKey, value s
 	if err != nil {
 		return err
 	}
-	switch key.kind {
-	case kindEndpointSlice:
-		_, err = c.kubeClient.DiscoveryV1().EndpointSlices(key.namespace).
-			Patch(ctx, key.name, types.MergePatchType, data, metav1.PatchOptions{})
-	case kindEndpoints:
-		_, err = c.kubeClient.CoreV1().Endpoints(key.namespace).
-			Patch(ctx, key.name, types.MergePatchType, data, metav1.PatchOptions{})
-	}
+	_, err = c.kubeClient.DiscoveryV1().EndpointSlices(key.namespace).
+		Patch(ctx, key.name, types.MergePatchType, data, metav1.PatchOptions{})
 	if err != nil {
 		return ignoreNotFound(err)
 	}
-	klog.V(2).Infof("refilter: patched %s %s/%s so that edge nodes filter it again", key.kind, key.namespace, key.name)
+	klog.V(2).Infof("refilter: patched EndpointSlice %s/%s so that edge nodes filter it again", key.namespace, key.name)
 	return nil
 }
 

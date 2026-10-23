@@ -114,13 +114,11 @@ func TestRefilterScopedServiceIsAnnotated(t *testing.T) {
 	c, client := newTestController(t, "",
 		testNode("n1", "g1"),
 		testService("svc", nodegroup.ServiceTopologyRangeNodegroup),
-		testSlice("svc-abc", "svc", ""),
-		testEndpoints("svc"))
+		testSlice("svc-abc", "svc", ""))
 
 	syncKey(t, c, kindEndpointSlice, "svc-abc")
-	syncKey(t, c, kindEndpoints, "svc")
 
-	assert.Equal(t, []string{"endpointslices/svc-abc", "endpoints/svc"}, patchedNames(client))
+	assert.Equal(t, []string{"endpointslices/svc-abc"}, patchedNames(client))
 	value, ok := sliceAnnotation(t, client, "svc-abc")
 	assert.True(t, ok)
 	assert.Equal(t, c.filterInputsHash(), value)
@@ -147,13 +145,11 @@ func TestRefilterUnscopedServiceIsNotTouched(t *testing.T) {
 		testService("optout", nodegroup.ServiceTopologyRangeCluster),
 		testSlice("plain-abc", "plain", ""),
 		testSlice("optout-abc", "optout", ""),
-		testSlice("orphan", "", ""),
-		testEndpoints("plain"))
+		testSlice("orphan", "", ""))
 
 	for _, name := range []string{"plain-abc", "optout-abc", "orphan"} {
 		syncKey(t, c, kindEndpointSlice, name)
 	}
-	syncKey(t, c, kindEndpoints, "plain")
 	assert.Empty(t, patchedNames(client))
 }
 
@@ -199,7 +195,6 @@ func TestRefilterWaitsForService(t *testing.T) {
 func TestRefilterMissingObject(t *testing.T) {
 	c, client := newTestController(t, "", testNode("n1", "g1"))
 	syncKey(t, c, kindEndpointSlice, "gone")
-	syncKey(t, c, kindEndpoints, "gone")
 	assert.Empty(t, patchedNames(client))
 }
 
@@ -211,7 +206,8 @@ func TestRefilterRun(t *testing.T) {
 		testService("scoped", nodegroup.ServiceTopologyRangeNodegroup),
 		testService("plain", ""),
 		testSlice("scoped-abc", "scoped", ""),
-		testSlice("plain-abc", "plain", ""))
+		testSlice("plain-abc", "plain", ""),
+		testEndpoints("scoped"))
 	factory := informers.NewSharedInformerFactory(client, 0)
 	c, err := NewRefilterController(client, factory, "")
 	require.NoError(t, err)
@@ -248,6 +244,13 @@ func TestRefilterRun(t *testing.T) {
 
 	_, ok := sliceAnnotation(t, client, "plain-abc")
 	assert.False(t, ok, "a slice of an unscoped Service must never be annotated")
+
+	// The controller leaves core/v1 Endpoints out on purpose: it must not
+	// even list or watch them, because the API is deprecated.
+	for _, action := range client.Actions() {
+		assert.NotEqual(t, "endpoints", action.GetResource().Resource,
+			"the controller sent a %s request for Endpoints", action.GetVerb())
+	}
 }
 
 // TestRefilterNodeLeavesNodeGroup: removing a node from its NodeGroup changes

@@ -94,7 +94,7 @@ func (dctl *DynamicController) Start() {
 }
 
 // startRefilter starts the controller that makes edge nodes filter their
-// cached EndpointSlices and Endpoints again when the filter inputs change.
+// cached EndpointSlices again when the filter inputs change.
 func (dctl *DynamicController) startRefilter() {
 	factory := informers.GetInformersManager().GetKubeInformerFactory()
 	refilter, err := endpointresource.NewRefilterController(client.GetKubeClient(), factory,
