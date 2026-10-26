@@ -7,12 +7,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/kubeedge/kubeedge/cloud/pkg/controllermanager/nodegroup"
 )
 
-func TestIsBelongToSameGroup(t *testing.T) {
+func TestSameGroupAs(t *testing.T) {
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	nodes := map[string]string{
 		"edge-a1": "site-a",
@@ -29,7 +30,11 @@ func TestIsBelongToSameGroup(t *testing.T) {
 		assert.NoError(t, indexer.Add(node))
 	}
 	lister := cache.NewGenericLister(indexer, v1.Resource("nodes"))
-	patches := gomonkey.ApplyFuncReturn(GetSyncedResourceLister, lister, nil)
+	listerCalls := 0
+	patches := gomonkey.ApplyFunc(GetSyncedResourceLister, func(schema.GroupVersionResource) (cache.GenericLister, error) {
+		listerCalls++
+		return lister, nil
+	})
 	defer patches.Reset()
 
 	cases := []struct {
@@ -47,6 +52,14 @@ func TestIsBelongToSameGroup(t *testing.T) {
 		{"edge-a1", "missing", false},
 	}
 	for _, c := range cases {
-		assert.Equal(t, c.want, IsBelongToSameGroup(c.target, c.ep), "%s -> %s", c.target, c.ep)
+		assert.Equal(t, c.want, SameGroupAs(c.target)(c.ep), "%s -> %s", c.target, c.ep)
 	}
+
+	// The lister is looked up once per SameGroupAs call, not once per endpoint.
+	listerCalls = 0
+	inGroup := SameGroupAs("edge-a1")
+	for _, ep := range []string{"edge-a2", "edge-b1", "cloud-1"} {
+		inGroup(ep)
+	}
+	assert.Equal(t, 1, listerCalls)
 }

@@ -112,8 +112,8 @@ func setupPatchesForService(svc *v1.Service) *gomonkey.Patches {
 
 	patches.ApplyFuncReturn(filter.GetSyncedResourceLister, mockInformer.Lister(), nil)
 
-	patches.ApplyFunc(filter.IsBelongToSameGroup, func(node1, node2 string) bool {
-		return node2 == nodeName1
+	patches.ApplyFuncReturn(filter.SameGroupAs, func(nodeName string) bool {
+		return nodeName == nodeName1
 	})
 
 	return patches
@@ -296,7 +296,7 @@ func TestFilterEndpointsAddress(t *testing.T) {
 		},
 	}
 
-	result := filterEndpointsAddress("target-node", addresses)
+	result := filterEndpointsAddress(filter.SameGroupAs("target-node"), addresses)
 
 	assert.Len(t, result, 1, "Should only include addresses from node1")
 	assert.Equal(t, "192.168.1.1", result[0].IP)
