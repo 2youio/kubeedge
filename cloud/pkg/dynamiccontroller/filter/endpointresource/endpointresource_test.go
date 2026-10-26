@@ -17,6 +17,7 @@ limitations under the License.
 package endpointresource
 
 import (
+	"maps"
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
@@ -619,6 +620,12 @@ func TestMessageFilterKeepsDefaultMaster(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "kubernetes", Namespace: "default"},
 	})
 	defer patches.Reset()
+	saved := maps.Clone(filter.GetFilters())
+	t.Cleanup(func() {
+		filters := filter.GetFilters()
+		clear(filters)
+		maps.Copy(filters, saved)
+	})
 	Register(nodegroup.ServiceTopologyRangeNodegroup)
 	defaultmaster.Register()
 
