@@ -3,6 +3,7 @@ package endpointresource
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	v1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
@@ -90,15 +91,28 @@ func getService(namespace, name string) (*v1.Service, error) {
 	return nil, fmt.Errorf("unexpected type %T for service %s/%s", svcRaw, namespace, name)
 }
 
+// unknownTopologyLogged holds the Services already logged for an unknown
+// service-topology value, keyed by namespace/name=value. isScoped runs for
+// every edge node on every event, so each value is logged once, not each time.
+var unknownTopologyLogged sync.Map
+
 // isScoped reports whether svc's endpoints are scoped to the receiving node's
 // NodeGroup. The annotation wins; without it the default applies, but only to
-// Services with a selector, whose endpoints carry the node they run on.
+// Services with a selector, whose endpoints carry the node they run on. An
+// unknown annotation value is treated as no annotation.
 func isScoped(svc *v1.Service, defaultTopology string) bool {
-	switch svc.Annotations[nodegroup.ServiceTopologyAnnotation] {
+	switch value := svc.Annotations[nodegroup.ServiceTopologyAnnotation]; value {
 	case nodegroup.ServiceTopologyRangeNodegroup:
 		return true
 	case nodegroup.ServiceTopologyRangeCluster:
 		return false
+	case "":
+	default:
+		key := svc.Namespace + "/" + svc.Name + "=" + value
+		if _, logged := unknownTopologyLogged.LoadOrStore(key, struct{}{}); !logged {
+			klog.Warningf("service %s/%s has unknown %s value %q, treating it as unset (defaultServiceTopology %q)",
+				svc.Namespace, svc.Name, nodegroup.ServiceTopologyAnnotation, value, defaultTopology)
+		}
 	}
 	return defaultTopology == nodegroup.ServiceTopologyRangeNodegroup && len(svc.Spec.Selector) > 0
 }
