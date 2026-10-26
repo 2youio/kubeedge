@@ -8,7 +8,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
@@ -69,19 +68,16 @@ func IsBelongToSameGroup(targetNodeName string, epNodeName string) bool {
 	epGroup := epNodeAccessor.GetLabels()[nodegroup.LabelBelongingTo]
 	return targetGroup != "" && targetGroup == epGroup
 }
-func GetDynamicResourceInformer(gvr schema.GroupVersionResource) informers.GenericInformer {
-	return commoninformers.GetInformersManager().GetDynamicInformerFactory().ForResource(gvr)
-}
 
 // GetSyncedResourceLister returns a lister for gvr backed by an informer the
 // informers manager has actually started and synced.
 //
-// GetDynamicResourceInformer must not be used for built-in resources such as
+// Do not ask the dynamic informer factory for built-in resources such as
 // services and nodes: the informers manager serves those from the *typed*
-// informer factory (see informers.forResource), so asking the dynamic factory
-// for them lazily creates a second informer that nobody ever starts. Its cache
-// stays empty for the process lifetime and every Lister lookup returns NotFound,
-// which silently disables any filter built on top of it.
+// informer factory (see informers.forResource), so the dynamic factory lazily
+// creates a second informer that nobody ever starts. Its cache stays empty for
+// the process lifetime and every Lister lookup returns NotFound, which silently
+// disables any filter built on top of it.
 //
 //go:noinline
 func GetSyncedResourceLister(gvr schema.GroupVersionResource) (cache.GenericLister, error) {

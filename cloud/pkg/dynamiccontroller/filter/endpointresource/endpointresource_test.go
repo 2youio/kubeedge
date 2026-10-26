@@ -105,7 +105,6 @@ func setupPatchesForService(svc *v1.Service) *gomonkey.Patches {
 
 	patches := gomonkey.NewPatches()
 
-	patches.ApplyFuncReturn(filter.GetDynamicResourceInformer, mockInformer)
 	patches.ApplyFuncReturn(filter.GetSyncedResourceLister, mockInformer.Lister(), nil)
 
 	patches.ApplyFunc(filter.IsBelongToSameGroup, func(node1, node2 string) bool {
@@ -398,8 +397,6 @@ func TestFilterEndpointsAddress(t *testing.T) {
 
 // 	patches := gomonkey.NewPatches()
 // 	defer patches.Reset()
-
-// 	patches.ApplyFuncReturn(filter.GetDynamicResourceInformer, mockInformer)
 
 // 	patches.ApplyFunc(meta.Accessor, func(obj interface{}) (metav1.Object, error) {
 // 		return svc.ObjectMeta.DeepCopy(), nil
