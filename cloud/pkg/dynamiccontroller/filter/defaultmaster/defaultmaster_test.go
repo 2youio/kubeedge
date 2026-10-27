@@ -188,12 +188,11 @@ func TestMessageFilterOnlyRewritesDefaultMasterEndpointSlice(t *testing.T) {
 	unrelatedBefore := list.Items[0].DeepCopy()
 	oldFilter, hadOldFilter := dynamicfilter.GetFilters()[filterName]
 	t.Cleanup(func() {
-		filters := dynamicfilter.GetFilters()
 		if hadOldFilter {
-			filters[filterName] = oldFilter
+			dynamicfilter.Register(oldFilter)
 			return
 		}
-		delete(filters, filterName)
+		dynamicfilter.Unregister(filterName)
 	})
 	dynamicfilter.Register(newDefaultMasterFilter())
 	dynamicfilter.MessageFilter(list, "edge-node")
