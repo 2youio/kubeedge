@@ -40,25 +40,30 @@ func (f *FilterImpl) Name() string {
 	return filterName
 }
 
+func isDefaultMasterEndpointSlice(obj *unstructured.Unstructured) bool {
+	return obj.GetObjectKind().GroupVersionKind().Kind == resourceName &&
+		obj.GetName() == defaultEndpointSliceName &&
+		obj.GetNamespace() == defaultEndpointSliceNameSpace
+}
+
 func (f *FilterImpl) NeedFilter(content interface{}) bool {
 	if objList, ok := content.(*unstructured.UnstructuredList); ok {
-		if len(objList.Items) != 0 && objList.Items[0].GetObjectKind().GroupVersionKind().Kind == resourceName {
-			return true
+		for i := range objList.Items {
+			if isDefaultMasterEndpointSlice(&objList.Items[i]) {
+				return true
+			}
 		}
 		return false
 	}
 	if obj, ok := content.(*unstructured.Unstructured); ok {
-		if obj.GetObjectKind().GroupVersionKind().Kind == resourceName && obj.GetName() == defaultEndpointSliceName &&
-			obj.GetNamespace() == defaultEndpointSliceNameSpace {
-			return true
-		}
+		return isDefaultMasterEndpointSlice(obj)
 	}
 	return false
 }
 
 func (f *FilterImpl) FilterResource(_ string, obj runtime.Object) {
 	unstruct, ok := obj.(*unstructured.Unstructured)
-	if !ok {
+	if !ok || !isDefaultMasterEndpointSlice(unstruct) {
 		return
 	}
 	var eps discovery.EndpointSlice
@@ -77,16 +82,17 @@ func (f *FilterImpl) FilterResource(_ string, obj runtime.Object) {
 		eps.Endpoints[0].Addresses = eps.Endpoints[0].Addresses[:1]
 		eps.Endpoints[0].Addresses[0] = defaultMetaServerIP
 		for i := range eps.Ports {
-			if *(eps.Ports[i].Name) != defaultEndpointSlicePortName {
+			if eps.Ports[i].Name == nil || *eps.Ports[i].Name != defaultEndpointSlicePortName {
 				continue
 			}
-			*(eps.Ports[i].Port) = defaultMetaServerPort
-			unstrRaw, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&eps)
-			if err != nil {
-				klog.Errorf("default endpointslice %v convert to unstructure error: %v", eps.Name, err)
-				return
-			}
-			unstruct.SetUnstructuredContent(unstrRaw)
+			port := f.port
+			eps.Ports[i].Port = &port
 		}
+		unstrRaw, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&eps)
+		if err != nil {
+			klog.Errorf("default endpointslice %v convert to unstructure error: %v", eps.Name, err)
+			return
+		}
+		unstruct.SetUnstructuredContent(unstrRaw)
 	}
 }
