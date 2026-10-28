@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/klog/v2"
@@ -66,6 +67,9 @@ func (s *imitator) Inject(msg model.Message) {
 			// sees a second DELETED. One without resourceVersion reaches no watch (it parses to
 			// 0): there is no stored object to send, and its own body has no labels or spec.
 			checkRV = !removed
+			if removed {
+				s.deleteNamespaceContents(e.Object)
+			}
 		}
 		if err != nil {
 			key := metaserver.KeyFunc(e.Object)
@@ -118,6 +122,57 @@ func (s *imitator) deleteStored(obj runtime.Object) (_ runtime.Object, removed, 
 		return obj, removed, kept, nil
 	}
 	return stored, true, false, nil
+}
+
+// podGVR is left out of deleteNamespaceContents: edged manages pods through its own messages.
+var podGVR = schema.GroupVersionResource{Version: "v1", Resource: "pods"}.String()
+
+// deleteNamespaceContents removes the rows of the objects in the deleted Namespace obj and sends
+// their DELETEDs. The cloud loses those deletes when the namespace's only edge watcher ran in it,
+// or the edge was offline, because their ObjectSyncs go with the namespace (KEDEV-834).
+func (s *imitator) deleteNamespaceContents(obj runtime.Object) {
+	key, err := metaserver.KeyFuncObj(obj)
+	if err != nil {
+		return
+	}
+	gvr, _, ns := metaserver.ParseKey(key)
+	if gvr.Group != "" || gvr.Resource != "namespaces" || ns == "" || ns == v2.NullNamespace {
+		return
+	}
+	for _, o := range s.deleteNamespaced(ns) {
+		watchhook.Trigger(watch.Event{Type: watch.Deleted, Object: o}, false)
+	}
+}
+
+// deleteNamespaced deletes the rows of the non-pod objects in namespace ns, and returns the
+// objects that decode, so watches can be told. A row that does not decode is deleted all the same.
+func (s *imitator) deleteNamespaced(ns string) []runtime.Object {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	var rows []v2.MetaV2
+	qs := dbm.DBAccess.QueryTable(v2.NewMetaTableName).Filter(v2.NS, ns).Exclude(v2.GVR, podGVR)
+	if _, err := qs.All(&rows); err != nil {
+		klog.Errorf("[imitator] list rows of deleted namespace %s: %v", ns, err)
+		return nil
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	if _, err := qs.Delete(); err != nil {
+		klog.Errorf("[imitator] delete rows of deleted namespace %s: %v", ns, err)
+		return nil
+	}
+	objs := make([]runtime.Object, 0, len(rows))
+	for _, row := range rows {
+		obj := new(unstructured.Unstructured)
+		if err := patchutil.DecodeStored(s.codec, row.Value, obj); err != nil {
+			klog.Errorf("[imitator] decode %s of deleted namespace %s: %v", row.Key, ns, err)
+			continue
+		}
+		objs = append(objs, obj)
+	}
+	klog.Infof("[imitator] namespace %s deleted: removed %d rows left in it", ns, len(rows))
+	return objs
 }
 
 // storedObj returns the object under key as Get serves it, or nil if there is none or it
