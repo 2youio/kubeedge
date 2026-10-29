@@ -8,8 +8,8 @@ import (
 )
 
 // MetaServer accepts protobuf REQUEST bodies -- that is what unblocks
-// calico-node, and the write handlers get there by decoding the body themselves
-// rather than by negotiating against this list. Responses are a separate
+// calico-node, and the write handlers get there by converting a protobuf body
+// to JSON before the stock handler sees it, not by negotiating against this list. Responses are a separate
 // question, and the answer is no.
 //
 // Offering protobuf here changes OUTPUT negotiation for every client whose
