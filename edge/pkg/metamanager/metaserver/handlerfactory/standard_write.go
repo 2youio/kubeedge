@@ -49,7 +49,7 @@ func (f *Factory) Create(req *request.RequestInfo) http.Handler {
 		Kind:    util.UnsafeResourceToKind(req.Resource),
 	}
 	h := handlers.CreateResource(f.storage, s, fakers.NewAlwaysAdmit())
-	return h
+	return protobufToJSON(h, s)
 }
 
 func (f *Factory) Update(req *request.RequestInfo) http.Handler {
@@ -64,7 +64,7 @@ func (f *Factory) Update(req *request.RequestInfo) http.Handler {
 		Kind:    util.UnsafeResourceToKind(req.Resource),
 	}
 	h := handlers.UpdateResource(f.storage, s, fakers.NewAlwaysAdmit())
-	return h
+	return protobufToJSON(h, s)
 }
 
 func (f *Factory) Delete() http.Handler {
