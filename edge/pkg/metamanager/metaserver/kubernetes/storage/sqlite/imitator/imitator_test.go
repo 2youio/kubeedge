@@ -402,7 +402,8 @@ func namespaceStub(name, uid string) *unstructured.Unstructured {
 	return testObj("v1", "Namespace", "", name, uid, "")
 }
 
-func storedKeys(t *testing.T, s *imitator) []string {
+func storedKeys(t *testing.T) []string {
+	t.Helper()
 	var keys []string
 	if _, err := dbm.DBAccess.Raw("SELECT key FROM meta_v2 ORDER BY key").QueryRows(&keys); err != nil {
 		t.Fatal(err)
@@ -465,7 +466,7 @@ func TestInjectNamespaceDeleteRemovesContents(t *testing.T) {
 		"/core/v1/pods/ns1/web-0",
 		"/discovery.k8s.io/v1/endpointslices/ns2/echo-xyz",
 	}
-	if got := storedKeys(t, s); !reflect.DeepEqual(got, want) {
+	if got := storedKeys(t); !reflect.DeepEqual(got, want) {
 		t.Errorf("meta_v2 keys = %v, want %v", got, want)
 	}
 }
@@ -489,7 +490,7 @@ func TestInjectNamespaceDeleteKeepsContents(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			before := storedKeys(t, s)
+			before := storedKeys(t)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -499,7 +500,7 @@ func TestInjectNamespaceDeleteKeepsContents(t *testing.T) {
 			if e, ok := nextEvent(slices); ok {
 				t.Errorf("slice watch got %s for the delete of another namespace", e.Type)
 			}
-			if got := storedKeys(t, s); !reflect.DeepEqual(got, before) {
+			if got := storedKeys(t); !reflect.DeepEqual(got, before) {
 				t.Errorf("meta_v2 keys = %v, want %v", got, before)
 			}
 		})
@@ -558,8 +559,72 @@ func TestInjectNamespaceDeleteKeepsNewerContents(t *testing.T) {
 				"/discovery.k8s.io/v1/endpointslices/ns1/echo-new",
 				"/discovery.k8s.io/v1/endpointslices/ns2/echo-xyz",
 			}
-			if got := storedKeys(t, s); !reflect.DeepEqual(got, want) {
+			if got := storedKeys(t); !reflect.DeepEqual(got, want) {
 				t.Errorf("meta_v2 keys = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// When the Namespace recreated under the name of ns1 replaces its row before the late DELETE of
+// the old one arrives, the rows created before the new namespace go then, and the newer stay.
+// An update of the same namespace removes nothing.
+func TestInjectNamespaceRecreatedRemovesOlderContents(t *testing.T) {
+	created := time.Date(2026, 10, 29, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		uid     string
+		deleted []string
+		want    []string
+	}{
+		{"recreated namespace", "uid-ns1-new", []string{"echo-abc"}, []string{
+			"/core/v1/namespaces/null/ns1",
+			"/core/v1/pods/default/web-0",
+			"/core/v1/pods/ns1/web-0",
+			"/discovery.k8s.io/v1/endpointslices/ns1/echo-new",
+			"/discovery.k8s.io/v1/endpointslices/ns2/echo-xyz",
+		}},
+		{"same namespace updated", "uid-ns1", nil, []string{
+			"/core/v1/namespaces/null/ns1",
+			"/core/v1/pods/default/web-0",
+			"/core/v1/pods/ns1/web-0",
+			"/core/v1/services/ns1/echo",
+			"/discovery.k8s.io/v1/endpointslices/ns1/echo-abc",
+			"/discovery.k8s.io/v1/endpointslices/ns1/echo-new",
+			"/discovery.k8s.io/v1/endpointslices/ns2/echo-xyz",
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := newTestImitator(t)
+			fillNamespaces(s, "uid-ns1")
+			oldSlice := testObj("discovery.k8s.io/v1", "EndpointSlice", "ns1", "echo-abc", "uid-s1", "10")
+			oldSlice.SetCreationTimestamp(metav1.NewTime(created.Add(-time.Hour)))
+			newSlice := testObj("discovery.k8s.io/v1", "EndpointSlice", "ns1", "echo-new", "uid-s3", "20")
+			newSlice.SetCreationTimestamp(metav1.NewTime(created))
+			s.Inject(objMessage(model.UpdateOperation, oldSlice))
+			s.Inject(objMessage(model.InsertOperation, newSlice))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			slices := s.Watch(ctx, "/discovery.k8s.io/v1/endpointslices/ns1", 0)
+
+			ns := testObj("v1", "Namespace", "", "ns1", test.uid, "30")
+			ns.SetCreationTimestamp(metav1.NewTime(created))
+			go s.Inject(objMessage(model.InsertOperation, ns))
+			var deleted []string
+			for {
+				e, ok := nextEvent(slices)
+				if !ok {
+					break
+				}
+				deleted = append(deleted, e.Object.(*unstructured.Unstructured).GetName())
+			}
+			if !reflect.DeepEqual(deleted, test.deleted) {
+				t.Errorf("slice watch got DELETED for %v, want %v", deleted, test.deleted)
+			}
+			if got := storedKeys(t); !reflect.DeepEqual(got, test.want) {
+				t.Errorf("meta_v2 keys = %v, want %v", got, test.want)
 			}
 		})
 	}
