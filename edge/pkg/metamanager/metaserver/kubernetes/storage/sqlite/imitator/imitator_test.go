@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/beego/beego/v2/client/orm"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
@@ -500,6 +501,65 @@ func TestInjectNamespaceDeleteKeepsContents(t *testing.T) {
 			}
 			if got := storedKeys(t, s); !reflect.DeepEqual(got, before) {
 				t.Errorf("meta_v2 keys = %v, want %v", got, before)
+			}
+		})
+	}
+}
+
+// A late DELETE of the old namespace ns1 removes the rows created before ns1 was deleted, and
+// keeps the slice of the namespace recreated under the name, which the edge got while it still
+// held the old Namespace row.
+func TestInjectNamespaceDeleteKeepsNewerContents(t *testing.T) {
+	deleted := metav1.NewTime(time.Date(2026, 10, 29, 10, 0, 0, 0, time.UTC))
+	terminating := testObj("v1", "Namespace", "", "ns1", "uid-ns1", "6")
+	terminating.SetDeletionTimestamp(&deleted)
+	stampedStub := namespaceStub("ns1", "uid-ns1")
+	stampedStub.SetDeletionTimestamp(&deleted)
+	tests := []struct {
+		name     string
+		stored   *unstructured.Unstructured // the Namespace row when the DELETE arrives
+		deletion *unstructured.Unstructured
+	}{
+		{"DELETE with the last state", nil, terminating},
+		{"resent DELETE with deletionTimestamp", nil, stampedStub},
+		{"resent DELETE, stored namespace terminating", terminating, namespaceStub("ns1", "uid-ns1")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := newTestImitator(t)
+			fillNamespaces(s, "uid-ns1")
+			if test.stored != nil {
+				s.Inject(objMessage(model.UpdateOperation, test.stored))
+			}
+			oldSlice := testObj("discovery.k8s.io/v1", "EndpointSlice", "ns1", "echo-abc", "uid-s1", "10")
+			oldSlice.SetCreationTimestamp(metav1.NewTime(deleted.Add(-time.Hour)))
+			newSlice := testObj("discovery.k8s.io/v1", "EndpointSlice", "ns1", "echo-new", "uid-s3", "20")
+			newSlice.SetCreationTimestamp(metav1.NewTime(deleted.Add(time.Minute)))
+			s.Inject(objMessage(model.UpdateOperation, oldSlice))
+			s.Inject(objMessage(model.InsertOperation, newSlice))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			slices := s.Watch(ctx, "/discovery.k8s.io/v1/endpointslices/ns1", 0)
+
+			go s.Inject(objMessage(model.DeleteOperation, test.deletion))
+			for {
+				e, ok := nextEvent(slices)
+				if !ok {
+					break
+				}
+				if name := e.Object.(*unstructured.Unstructured).GetName(); name != "echo-abc" {
+					t.Errorf("slice watch got %s %s, want only DELETED echo-abc", e.Type, name)
+				}
+			}
+			want := []string{
+				"/core/v1/pods/default/web-0",
+				"/core/v1/pods/ns1/web-0",
+				"/discovery.k8s.io/v1/endpointslices/ns1/echo-new",
+				"/discovery.k8s.io/v1/endpointslices/ns2/echo-xyz",
+			}
+			if got := storedKeys(t, s); !reflect.DeepEqual(got, want) {
+				t.Errorf("meta_v2 keys = %v, want %v", got, want)
 			}
 		})
 	}

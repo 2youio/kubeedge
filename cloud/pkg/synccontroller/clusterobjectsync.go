@@ -3,6 +3,7 @@ package synccontroller
 import (
 	"context"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -32,8 +33,8 @@ var (
 
 	compareResourceVersionFunc = CompareResourceVersion
 
-	gcOrphanedClusterObjectSyncFunc = func(sctl *SyncController, sync *v1alpha1.ClusterObjectSync) {
-		sctl.gcOrphanedClusterObjectSyncImpl(sync)
+	gcOrphanedClusterObjectSyncFunc = func(sctl *SyncController, sync *v1alpha1.ClusterObjectSync, recreated metav1.Object) {
+		sctl.gcOrphanedClusterObjectSyncImpl(sync, recreated)
 	}
 
 	deleteClusterObjectSyncFunc = func(sctl *SyncController, name string) error {
@@ -60,7 +61,7 @@ func (sctl *SyncController) reconcileClusterObjectSync(sync *v1alpha1.ClusterObj
 
 	ret, err := lister.Get(sync.Spec.ObjectName)
 	if apierrors.IsNotFound(err) {
-		sctl.gcOrphanedClusterObjectSync(sync)
+		sctl.gcOrphanedClusterObjectSync(sync, nil)
 		return
 	}
 
@@ -77,15 +78,15 @@ func (sctl *SyncController) reconcileClusterObjectSync(sync *v1alpha1.ClusterObj
 
 	syncObjUID := getObjectUIDFunc(sync.Name)
 	if syncObjUID != string(object.GetUID()) {
-		sctl.gcOrphanedClusterObjectSync(sync)
+		sctl.gcOrphanedClusterObjectSync(sync, object)
 		return
 	}
 
 	sendClusterObjectSyncEvent(nodeName, sync, resourceType, object.GetResourceVersion(), object)
 }
 
-func (sctl *SyncController) gcOrphanedClusterObjectSync(sync *v1alpha1.ClusterObjectSync) {
-	gcOrphanedClusterObjectSyncFunc(sctl, sync)
+func (sctl *SyncController) gcOrphanedClusterObjectSync(sync *v1alpha1.ClusterObjectSync, recreated metav1.Object) {
+	gcOrphanedClusterObjectSyncFunc(sctl, sync, recreated)
 }
 
 // gcOrphanedClusterObjectSyncImpl try to send delete message to the edge node
@@ -93,7 +94,8 @@ func (sctl *SyncController) gcOrphanedClusterObjectSync(sync *v1alpha1.ClusterOb
 // message ACK is received by `cloudHub`, the objectSync will be deleted
 // directly in the `cloudHub`. But if message build failed, the ClusterObjectSync
 // will be deleted directly in the `syncController`.
-func (sctl *SyncController) gcOrphanedClusterObjectSyncImpl(sync *v1alpha1.ClusterObjectSync) {
+// recreated is the object that now has the name, or nil if there is none.
+func (sctl *SyncController) gcOrphanedClusterObjectSyncImpl(sync *v1alpha1.ClusterObjectSync, recreated metav1.Object) {
 	resourceType := strings.ToLower(sync.Spec.ObjectKind)
 	nodeName := getNodeNameFunc(sync.Name)
 	klog.V(4).Infof("%s: %s has been deleted in K8s, send the delete event to edge in sync loop", resourceType, sync.Spec.ObjectName)
@@ -106,6 +108,16 @@ func (sctl *SyncController) gcOrphanedClusterObjectSyncImpl(sync *v1alpha1.Clust
 	object.SetKind(sync.Spec.ObjectKind)
 	object.SetName(sync.Spec.ObjectName)
 	object.SetUID(types.UID(getObjectUIDFunc(sync.Name)))
+	// The deleted object was gone before the recreated one was created, and timestamps are in
+	// whole seconds, so a second before the creation is a deletionTimestamp the edge can trust.
+	// The edge then keeps the objects of a recreated Namespace, which are all newer
+	// (imitator.deleteNamespaceContents).
+	if recreated != nil {
+		if created := recreated.GetCreationTimestamp(); !created.IsZero() {
+			deleted := metav1.NewTime(created.Add(-time.Second))
+			object.SetDeletionTimestamp(&deleted)
+		}
+	}
 	if msg := buildEdgeControllerMessageFunc(nodeName, v2.NullNamespace, resourceType, sync.Spec.ObjectName, model.DeleteOperation, object); msg != nil {
 		sendToEdge(commonconst.DefaultContextSendModuleName, *msg)
 	} else {
