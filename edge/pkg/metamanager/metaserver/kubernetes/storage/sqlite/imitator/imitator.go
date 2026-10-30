@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/beego/beego/v2/client/orm"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -24,6 +25,7 @@ import (
 	"github.com/kubeedge/kubeedge/edge/pkg/common/dbm"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 	v2 "github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao/v2"
+	metaserverconfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/config"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/imitator/watchhook"
 	patchutil "github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/util"
 	"github.com/kubeedge/kubeedge/pkg/metaserver"
@@ -130,7 +132,7 @@ func (s *imitator) deleteStored(obj runtime.Object) (_ runtime.Object, removed, 
 	return stored, true, false, s.deleteNamespaceContents(obj, stored), nil
 }
 
-// podGVR is left out of deleteNamespaceContents: edged manages pods through its own messages.
+// podGVR names pods. This node's pods are left out of deleteNamespaceContents: edged manages them.
 var podGVR = schema.GroupVersionResource{Version: "v1", Resource: "pods"}.String()
 
 // deleteNamespaceContents removes the rows of the objects in the deleted Namespace, and returns
@@ -144,7 +146,8 @@ var podGVR = schema.GroupVersionResource{Version: "v1", Resource: "pods"}.String
 // recreated namespace's objects are all created after it. The edge can hold them before this
 // DELETE arrives when it never got the recreated Namespace. synccontroller.gcOrphanedClusterObjectSync
 // stamps the deletionTimestamp on the DELETE it resends for a recreated object. Without one,
-// every row goes.
+// every row goes. Timestamps are whole seconds, so an object created in the same second as the
+// cutoff can land on the wrong side; that needs delete, finalize and recreate within one second.
 func (s *imitator) deleteNamespaceContents(body, obj runtime.Object) []runtime.Object {
 	ns := namespaceName(body)
 	if ns == "" {
@@ -199,13 +202,13 @@ func triggerDeleted(objs []runtime.Object) {
 	}
 }
 
-// deleteNamespaced deletes the rows of the non-pod objects in namespace ns, except those created
-// after deleted when it is set, and returns the deleted objects that decode, so watches can be
-// told. A row that does not decode is deleted all the same. The caller holds s.lock.
+// deleteNamespaced deletes the rows of the objects in namespace ns, except this node's pods and
+// those created after deleted when it is set, and returns the deleted objects that decode, so
+// watches can be told. A row that does not decode is deleted all the same, unless it is a pod,
+// which may be this node's. The caller holds s.lock.
 func (s *imitator) deleteNamespaced(ns string, deleted *metav1.Time) []runtime.Object {
 	var rows []v2.MetaV2
-	qs := dbm.DBAccess.QueryTable(v2.NewMetaTableName).Filter(v2.NS, ns).Exclude(v2.GVR, podGVR)
-	if _, err := qs.All(&rows); err != nil {
+	if _, err := dbm.DBAccess.QueryTable(v2.NewMetaTableName).Filter(v2.NS, ns).All(&rows); err != nil {
 		klog.Errorf("[imitator] list rows of deleted namespace %s: %v", ns, err)
 		return nil
 	}
@@ -215,8 +218,15 @@ func (s *imitator) deleteNamespaced(ns string, deleted *metav1.Time) []runtime.O
 		obj := new(unstructured.Unstructured)
 		if err := patchutil.DecodeStored(s.codec, row.Value, obj); err != nil {
 			klog.Errorf("[imitator] decode %s of deleted namespace %s: %v", row.Key, ns, err)
-			keys = append(keys, row.Key)
+			if row.GroupVersionResource != podGVR {
+				keys = append(keys, row.Key)
+			}
 			continue
+		}
+		if row.GroupVersionResource == podGVR {
+			if node, _, _ := unstructured.NestedString(obj.Object, "spec", "nodeName"); node == metaserverconfig.Config.NodeName {
+				continue
+			}
 		}
 		if deleted != nil && obj.GetCreationTimestamp().After(deleted.Time) {
 			continue
@@ -224,16 +234,23 @@ func (s *imitator) deleteNamespaced(ns string, deleted *metav1.Time) []runtime.O
 		keys = append(keys, row.Key)
 		objs = append(objs, obj)
 	}
-	// Delete in chunks, to stay below SQLite's limit on bound parameters.
-	for start := 0; start < len(keys); start += deleteChunk {
-		chunk := keys[start:min(start+deleteChunk, len(keys))]
-		if _, err := dbm.DBAccess.QueryTable(v2.NewMetaTableName).Filter(v2.KEY+"__in", chunk).Delete(); err != nil {
-			klog.Errorf("[imitator] delete rows of deleted namespace %s: %v", ns, err)
-			return nil
+	// Delete in chunks, to stay below SQLite's limit on bound parameters, in one transaction, so
+	// that a failure leaves every row and sends no DELETED.
+	err := dbm.DBAccess.DoTx(func(_ context.Context, tx orm.TxOrmer) error {
+		for start := 0; start < len(keys); start += deleteChunk {
+			chunk := keys[start:min(start+deleteChunk, len(keys))]
+			if _, err := tx.QueryTable(v2.NewMetaTableName).Filter(v2.KEY+"__in", chunk).Delete(); err != nil {
+				return err
+			}
 		}
+		return nil
+	})
+	if err != nil {
+		klog.Errorf("[imitator] delete rows of deleted namespace %s: %v", ns, err)
+		return nil
 	}
 	if len(keys) > 0 {
-		klog.Infof("[imitator] namespace %s deleted: removed %d rows left in it, kept %d created after it",
+		klog.Infof("[imitator] namespace %s deleted: removed %d rows left in it, kept %d",
 			ns, len(keys), len(rows)-len(keys))
 	}
 	return objs

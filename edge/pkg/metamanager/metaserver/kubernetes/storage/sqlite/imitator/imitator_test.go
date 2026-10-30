@@ -2,6 +2,7 @@ package imitator
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -20,6 +21,7 @@ import (
 	"github.com/kubeedge/kubeedge/edge/pkg/common/dbm"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao"
 	v2 "github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao/v2"
+	metaserverconfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/config"
 )
 
 func TestMain(m *testing.M) {
@@ -29,6 +31,7 @@ func TestMain(m *testing.M) {
 	}
 	orm.RegisterModel(new(v2.MetaV2), new(dao.Meta))
 	dbm.InitDBConfig("sqlite3", "default", filepath.Join(dir, "edgecore.db"))
+	metaserverconfig.Config.NodeName = "edge-node"
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)
@@ -427,27 +430,36 @@ func fillNamespaces(s *imitator, ns1UID string) {
 	s.Inject(podMessage(model.InsertOperation, pod))
 }
 
-// The Namespace DELETE removes the rows the cloud never deleted, except pods, and every watch
-// of them gets DELETED, whatever its revision (KEDEV-834).
+// The Namespace DELETE removes the rows the cloud never deleted, except this node's pods, and
+// every watch of them gets DELETED, whatever its revision (KEDEV-834).
 func TestInjectNamespaceDeleteRemovesContents(t *testing.T) {
 	s := newTestImitator(t)
 	fillNamespaces(s, "uid-ns1")
+	otherPod := fullPod("r", "15")
+	otherPod.SetNamespace("ns1")
+	otherPod.SetName("web-1")
+	_ = unstructured.SetNestedField(otherPod.Object, "other-node", "spec", "nodeName")
+	if err := s.InsertOrUpdateObj(context.TODO(), otherPod); err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	slices := s.Watch(ctx, "/discovery.k8s.io/v1/endpointslices", 100)
 	services := s.Watch(ctx, "/core/v1/services/ns1", 100)
+	pods := s.Watch(ctx, "/core/v1/pods/ns1", 100)
 
 	go s.Inject(objMessage(model.DeleteOperation, namespaceStub("ns1", "uid-ns1")))
-	// The watches are unbuffered and get their events in row order, so read both at once.
+	// The watches are unbuffered and get their events in row order, so read them all at once.
 	deleted := map[string]string{}
-	for len(deleted) < 2 {
+	for len(deleted) < 3 {
 		var e watch.Event
 		select {
 		case e = <-slices:
 		case e = <-services:
+		case e = <-pods:
 		case <-time.After(time.Second):
-			t.Fatalf("watches got only %v, want DELETED for echo-abc and echo", deleted)
+			t.Fatalf("watches got only %v, want DELETED for echo-abc, echo and web-1", deleted)
 		}
 		obj := e.Object.(*unstructured.Unstructured)
 		if e.Type != watch.Deleted || obj.GetResourceVersion() == "" {
@@ -455,7 +467,7 @@ func TestInjectNamespaceDeleteRemovesContents(t *testing.T) {
 		}
 		deleted[obj.GetName()] = obj.GetKind()
 	}
-	if want := map[string]string{"echo-abc": "EndpointSlice", "echo": "Service"}; !reflect.DeepEqual(deleted, want) {
+	if want := map[string]string{"echo-abc": "EndpointSlice", "echo": "Service", "web-1": "Pod"}; !reflect.DeepEqual(deleted, want) {
 		t.Errorf("watches got DELETED for %v, want %v", deleted, want)
 	}
 	if e, ok := nextEvent(slices); ok {
@@ -627,5 +639,47 @@ func TestInjectNamespaceRecreatedRemovesOlderContents(t *testing.T) {
 				t.Errorf("meta_v2 keys = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+// When a later chunk of a namespace's rows fails to delete, the earlier chunks stay too, and no
+// watch gets a DELETED for rows that are still there.
+func TestInjectNamespaceDeleteRollsBack(t *testing.T) {
+	s := newTestImitator(t)
+	s.Inject(objMessage(model.InsertOperation, testObj("v1", "Namespace", "", "ns1", "uid-ns1", "5")))
+	n := deleteChunk + 1
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("cm-%04d", i)
+		value := fmt.Sprintf(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":%q,"namespace":"ns1","uid":"u-%d","resourceVersion":"%d"}}`, name, i, 10+i)
+		if _, err := dbm.DBAccess.Raw("INSERT INTO meta_v2 (key, groupversionresource, namespace, name, resourceversion, value) VALUES (?,?,?,?,?,?)",
+			"/core/v1/configmaps/ns1/"+name, "/v1, Resource=configmaps", "ns1", name, 10+i, value).Exec(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	last := fmt.Sprintf("/core/v1/configmaps/ns1/cm-%04d", n-1)
+	if _, err := dbm.DBAccess.Raw("CREATE TRIGGER fail_delete BEFORE DELETE ON meta_v2 WHEN old.key = '" + last +
+		"' BEGIN SELECT RAISE(ABORT, 'test failure'); END").Exec(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, err := dbm.DBAccess.Raw("DROP TRIGGER fail_delete").Exec(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	configMaps := s.Watch(ctx, "/core/v1/configmaps/ns1", 0)
+
+	go s.Inject(objMessage(model.DeleteOperation, namespaceStub("ns1", "uid-ns1")))
+	if e, ok := nextEvent(configMaps); ok {
+		t.Errorf("configmap watch got %s %s after a failed delete", e.Type, e.Object.(*unstructured.Unstructured).GetName())
+	}
+	var rows int
+	if err := dbm.DBAccess.Raw("SELECT count(*) FROM meta_v2 WHERE namespace = 'ns1'").QueryRow(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != n {
+		t.Errorf("meta_v2 holds %d rows of ns1, want all %d", rows, n)
 	}
 }
