@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The KubeEdge Authors.
+Copyright 2026 The KubeEdge Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ package handlerfactory
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -29,9 +28,9 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	authenticationv1 "k8s.io/api/authentication/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1 "k8s.io/api/policy/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -304,23 +303,48 @@ func TestWriteStorageError(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "cloud unreachable")
 }
 
-// Kinds of every built-in group decode, not only the core group's.
-func TestProtobufBodyToJSONKnowsAllBuiltInGroups(t *testing.T) {
-	for _, obj := range []runtime.Object{
-		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n"}},
-		&policyv1.Eviction{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"}},
-		&authenticationv1.TokenRequest{Spec: authenticationv1.TokenRequestSpec{Audiences: []string{"a"}}},
+// The protobuf limit applies to the body as sent, not to its larger JSON form.
+func TestCreateAcceptsProtobufBodyThatGrowsAsJSON(t *testing.T) {
+	fs := newFakeStorage(t)
+	info := &request.RequestInfo{IsResourceRequest: true, Verb: "create", APIVersion: "v1", Resource: "configmaps", Namespace: "default"}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "default"},
+		BinaryData: map[string][]byte{"b": make([]byte, 2_600_000)}, // over 3 MiB once base64 in JSON
+	}
+
+	w := serve(NewFactory().Create(info), http.MethodPost, "/api/v1/namespaces/default/configmaps",
+		info, runtime.ContentTypeProtobuf, protobufBody(t, cm))
+
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	assert.Equal(t, "ConfigMap", fs.gotContent(t)["kind"])
+}
+
+// Kinds of built-in groups other than core reach storage too. Subresources such
+// as pods/eviction are refused for JSON and protobuf alike, so they are not here.
+func TestCreateProtobufOtherBuiltInGroups(t *testing.T) {
+	for _, tc := range []struct {
+		obj  runtime.Object
+		info *request.RequestInfo
+	}{
+		{
+			&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: "l", Namespace: "default"}},
+			&request.RequestInfo{IsResourceRequest: true, Verb: "create", APIGroup: "coordination.k8s.io", APIVersion: "v1", Resource: "leases", Namespace: "default"},
+		},
+		{
+			&discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "default"}, AddressType: discoveryv1.AddressTypeIPv4},
+			&request.RequestInfo{IsResourceRequest: true, Verb: "create", APIGroup: "discovery.k8s.io", APIVersion: "v1", Resource: "endpointslices", Namespace: "default"},
+		},
 	} {
-		gvks, _, err := kubescheme.Scheme.ObjectKinds(obj)
-		require.NoError(t, err)
-		want := gvks[0]
+		body := protobufBody(t, tc.obj)
+		want := tc.obj.GetObjectKind().GroupVersionKind()
+		t.Run(want.String(), func(t *testing.T) {
+			fs := newFakeStorage(t)
+			w := serve(NewFactory().Create(tc.info), http.MethodPost, "/apis/"+want.GroupVersion().String(), tc.info, runtime.ContentTypeProtobuf, body)
 
-		out, err := protobufBodyToJSON(protobufBody(t, obj))
-		require.NoError(t, err, want.String())
-
-		var m map[string]interface{}
-		require.NoError(t, json.Unmarshal(out, &m))
-		assert.Equal(t, want.GroupVersion().String(), m["apiVersion"])
-		assert.Equal(t, want.Kind, m["kind"])
+			require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+			got := fs.gotContent(t)
+			assert.Equal(t, want.GroupVersion().String(), got["apiVersion"])
+			assert.Equal(t, want.Kind, got["kind"])
+		})
 	}
 }

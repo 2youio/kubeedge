@@ -42,7 +42,8 @@ var (
 // protobufToJSON lets the stock write handlers, which accept only JSON and YAML,
 // take a protobuf body: it decodes the body into its built-in type and passes it
 // on as JSON. Requests with any other content type pass through untouched.
-func protobufToJSON(h http.Handler, s *handlers.RequestScope) http.Handler {
+func protobufToJSON(s *handlers.RequestScope, newHandler func(*handlers.RequestScope) http.Handler) http.Handler {
+	h := newHandler(s)
 	scope := wrapScope{RequestScope: s}
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		mediaType, _, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
@@ -66,12 +67,16 @@ func protobufToJSON(h http.Handler, s *handlers.RequestScope) http.Handler {
 		req.Body = io.NopCloser(bytes.NewReader(jsonBody))
 		req.ContentLength = int64(len(jsonBody))
 		req.Header.Set("Content-Type", runtime.ContentTypeJSON)
-		h.ServeHTTP(w, req)
+		// The limit was checked on the body as sent; its JSON form is larger.
+		converted := *s
+		converted.MaxRequestBodyBytes = int64(len(jsonBody))
+		newHandler(&converted).ServeHTTP(w, req)
 	})
 }
 
 // protobufBodyToJSON returns API status errors: 415 for a kind that client-go's
-// scheme does not know, 400 for a body that is not valid protobuf.
+// scheme does not know, 400 for a body that is not valid protobuf. Fields that
+// edgecore's types lack are lost, and an update then removes them in the cloud.
 func protobufBodyToJSON(body []byte) ([]byte, error) {
 	obj, gvk, err := protobufDecoder.Decode(body, nil, nil)
 	if err != nil {
@@ -86,8 +91,7 @@ func protobufBodyToJSON(body []byte) ([]byte, error) {
 		return nil, errors.NewBadRequest(fmt.Sprintf("failed to decode the protobuf request body: %v", err))
 	}
 
-	// The decoded object has no TypeMeta, and the stock handler needs it.
-	obj.GetObjectKind().SetGroupVersionKind(*gvk)
+	// The decoder has set apiVersion and kind on obj, which the stock handler needs.
 	jsonBody, err := runtime.Encode(jsonEncoder, obj)
 	if err != nil {
 		return nil, errors.NewInternalError(fmt.Errorf("failed to encode the %v request body as JSON: %w", gvk, err))
