@@ -108,16 +108,17 @@ func (sctl *SyncController) gcOrphanedClusterObjectSyncImpl(sync *v1alpha1.Clust
 	object.SetKind(sync.Spec.ObjectKind)
 	object.SetName(sync.Spec.ObjectName)
 	object.SetUID(types.UID(getObjectUIDFunc(sync.Name)))
-	// The deleted object was gone before the recreated one was created, and timestamps are in
-	// whole seconds, so a second before the creation is a deletionTimestamp the edge can trust.
-	// The edge then keeps the objects of a recreated Namespace, which are all newer
-	// (imitator.deleteNamespaceContents).
+	// The deleted object was gone by now, and before a recreated one was created, so objects
+	// created later belong to the recreated Namespace and the edge keeps them
+	// (imitator.deleteNamespaceContents). A second earlier covers whole-second timestamps and lister lag.
+	gone := time.Now()
 	if recreated != nil {
 		if created := recreated.GetCreationTimestamp(); !created.IsZero() {
-			deleted := metav1.NewTime(created.Add(-time.Second))
-			object.SetDeletionTimestamp(&deleted)
+			gone = created.Time
 		}
 	}
+	deleted := metav1.NewTime(gone.Add(-time.Second))
+	object.SetDeletionTimestamp(&deleted)
 	if msg := buildEdgeControllerMessageFunc(nodeName, v2.NullNamespace, resourceType, sync.Spec.ObjectName, model.DeleteOperation, object); msg != nil {
 		sendToEdge(commonconst.DefaultContextSendModuleName, *msg)
 	} else {

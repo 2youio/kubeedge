@@ -145,7 +145,7 @@ var podGVR = schema.GroupVersionResource{Version: "v1", Resource: "pods"}.String
 // of a namespace recreated under its name: a terminating namespace takes no new objects, so the
 // recreated namespace's objects are all created after it. The edge can hold them before this
 // DELETE arrives when it never got the recreated Namespace. synccontroller.gcOrphanedClusterObjectSync
-// stamps the deletionTimestamp on the DELETE it resends for a recreated object. Without one,
+// stamps a deletionTimestamp on every DELETE it resends. Without one (an older cloudcore),
 // every row goes. Timestamps are whole seconds, so an object created in the same second as the
 // cutoff can land on the wrong side; that needs delete, finalize and recreate within one second.
 func (s *imitator) deleteNamespaceContents(body, obj runtime.Object) []runtime.Object {

@@ -594,7 +594,8 @@ func TestExecuteDeleteClusterObjectSyncFunc(t *testing.T) {
 }
 
 // The resent DELETE carries a deletionTimestamp a second before the creation of the object
-// recreated under the name, so the edge keeps a recreated Namespace's objects (KEDEV-834).
+// recreated under the name, else a second before now, so the edge keeps the objects of a
+// Namespace recreated before or after the resend (KEDEV-834).
 func TestGcOrphanedClusterObjectSyncStampsRecreation(t *testing.T) {
 	backup := setupTest()
 	defer backup.restore()
@@ -604,10 +605,11 @@ func TestGcOrphanedClusterObjectSyncStampsRecreation(t *testing.T) {
 	tests := []struct {
 		name      string
 		recreated metav1.Object
-		want      *metav1.Time
+		want      *metav1.Time // nil: a second before the call
 	}{
 		{"object gone", nil, nil},
 		{"object recreated", recreated, &metav1.Time{Time: created.Add(-time.Second)}},
+		{"recreated without creationTimestamp", &metav1.ObjectMeta{Name: "ns1", UID: "new-uid"}, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -619,14 +621,22 @@ func TestGcOrphanedClusterObjectSyncStampsRecreation(t *testing.T) {
 			sendToEdge = func(string, model.Message) {}
 
 			sync := createTestSync("node1-pod-12345", "ns1", "Namespace", "v1", "500")
+			// The body keeps the timestamp in whole seconds.
+			before := time.Now().Add(-time.Second).Truncate(time.Second)
 			(&SyncController{}).gcOrphanedClusterObjectSyncImpl(sync, tt.recreated)
+			after := time.Now().Add(-time.Second)
 
 			if body == nil {
 				t.Fatal("no DELETE was sent")
 			}
 			got := body.GetDeletionTimestamp()
-			if (got == nil) != (tt.want == nil) || (got != nil && !got.Equal(tt.want)) {
+			switch {
+			case got == nil:
+				t.Error("the DELETE has no deletionTimestamp")
+			case tt.want != nil && !got.Equal(tt.want):
 				t.Errorf("deletionTimestamp = %v, want %v", got, tt.want)
+			case tt.want == nil && (got.Before(&metav1.Time{Time: before}) || got.Time.After(after)):
+				t.Errorf("deletionTimestamp = %v, want between %v and %v", got, before, after)
 			}
 			if body.GetUID() != "12345" {
 				t.Errorf("uid = %q, want the deleted object's 12345", body.GetUID())
