@@ -53,7 +53,7 @@ func TestSupportedMediaTypes(t *testing.T) {
 	mediaTypes := factory.SupportedMediaTypes()
 
 	// No protobuf: an unstructured object cannot be encoded as protobuf, so offering
-	// it breaks custom-resource reads (2youio/kubeedge#7). Requests convert it instead.
+	// it breaks custom-resource reads. Requests convert it instead.
 	assert.Len(mediaTypes, 2)
 
 	jsonInfo := mediaTypes[0]
