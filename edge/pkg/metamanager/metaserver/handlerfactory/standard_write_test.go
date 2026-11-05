@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -42,6 +43,7 @@ import (
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
 	kubescheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/storage"
 )
@@ -516,4 +518,23 @@ func TestProtobufAlwaysSentFieldsNameKnownMessages(t *testing.T) {
 		require.NoError(t, err)
 		assert.Nil(t, fieldByNumber(m, f.number), "%s field %d is now in edgecore's types", f.message, f.number)
 	}
+}
+
+// A failure of the field check is a bug in edgecore, so it is logged as an error.
+func TestProtobufCheckFailureIsLogged(t *testing.T) {
+	patches := gomonkey.ApplyFunc(droppedProtobufFields, func([]byte, runtime.Object) ([]string, error) {
+		return nil, errors.New("no descriptor")
+	})
+	defer patches.Reset()
+	var logged string
+	patches.ApplyFunc(klog.Errorf, func(format string, args ...interface{}) { logged = fmt.Sprintf(format, args...) })
+
+	fs := newFakeStorage(t)
+	w := serve(NewFactory().Update(nodeUpdateInfo("n")), http.MethodPut, "/api/v1/nodes/n",
+		nodeUpdateInfo("n"), runtime.ContentTypeProtobuf, protobufNodeWithExtraFields(t, nil, nil))
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+	assert.Contains(t, logged, "failed to convert the protobuf body of PUT /api/v1/nodes/n")
+	assert.Contains(t, logged, "no descriptor")
+	assert.Equal(t, 0, fs.calls)
 }

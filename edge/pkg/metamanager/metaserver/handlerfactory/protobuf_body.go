@@ -64,9 +64,7 @@ func protobufToJSON(s *handlers.RequestScope, newHandler func(*handlers.RequestS
 		}
 		jsonBody, err := protobufBodyToJSON(body)
 		if err != nil {
-			if errors.IsUnsupportedMediaType(err) {
-				logRefusal(req, err)
-			}
+			logProtobufError(req, err)
 			scope.err(err, w, req)
 			return
 		}
@@ -82,16 +80,28 @@ func protobufToJSON(s *handlers.RequestScope, newHandler func(*handlers.RequestS
 	})
 }
 
-// A client retries a refused write, so warnings are limited to a few per minute.
-var refusalWarnings = rate.NewLimiter(rate.Every(20*time.Second), 3)
+// A client retries a refused or failed write, so each is logged a few times per
+// minute. Separate limits keep refusals from hiding a failure of the check.
+var (
+	refusalWarnings = rate.NewLimiter(rate.Every(20*time.Second), 3)
+	failureErrors   = rate.NewLimiter(rate.Every(20*time.Second), 3)
+)
 
-func logRefusal(req *http.Request, err error) {
-	msg := fmt.Sprintf("MetaServer refused the protobuf body of %s %s from %q: %v", req.Method, req.URL.Path, req.UserAgent(), err)
-	if refusalWarnings.Allow() {
-		klog.Warning(msg)
-	} else {
-		klog.V(4).Info(msg)
+// logProtobufError logs a 415 as a warning and a 500 as an error. A 400 is the
+// client's fault and is not logged.
+func logProtobufError(req *http.Request, err error) {
+	limiter, logf, verb := refusalWarnings, klog.Warningf, "refused"
+	switch {
+	case errors.IsUnsupportedMediaType(err):
+	case errors.IsInternalError(err):
+		limiter, logf, verb = failureErrors, klog.Errorf, "failed to convert"
+	default:
+		return
 	}
+	if !limiter.Allow() {
+		logf = klog.V(4).Infof
+	}
+	logf("MetaServer %s the protobuf body of %s %s from %q: %v", verb, req.Method, req.URL.Path, req.UserAgent(), err)
 }
 
 // protobufBodyToJSON returns API status errors: 415 for a kind or a field that
