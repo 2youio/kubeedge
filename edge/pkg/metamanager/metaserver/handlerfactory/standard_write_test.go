@@ -20,17 +20,24 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/types/descriptorpb"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	storagev1beta1 "k8s.io/api/storage/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -39,6 +46,7 @@ import (
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
 	kubescheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/storage"
 )
@@ -325,21 +333,25 @@ func TestCreateProtobufOtherBuiltInGroups(t *testing.T) {
 	for _, tc := range []struct {
 		obj  runtime.Object
 		info *request.RequestInfo
+		path string
 	}{
 		{
 			&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: "l", Namespace: "default"}},
 			&request.RequestInfo{IsResourceRequest: true, Verb: "create", APIGroup: "coordination.k8s.io", APIVersion: "v1", Resource: "leases", Namespace: "default"},
+			"/apis/coordination.k8s.io/v1/namespaces/default/leases",
 		},
 		{
 			&discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "default"}, AddressType: discoveryv1.AddressTypeIPv4},
 			&request.RequestInfo{IsResourceRequest: true, Verb: "create", APIGroup: "discovery.k8s.io", APIVersion: "v1", Resource: "endpointslices", Namespace: "default"},
+			"/apis/discovery.k8s.io/v1/namespaces/default/endpointslices",
 		},
 	} {
-		body := protobufBody(t, tc.obj)
-		want := tc.obj.GetObjectKind().GroupVersionKind()
+		gvks, _, err := kubescheme.Scheme.ObjectKinds(tc.obj)
+		require.NoError(t, err)
+		want := gvks[0]
 		t.Run(want.String(), func(t *testing.T) {
 			fs := newFakeStorage(t)
-			w := serve(NewFactory().Create(tc.info), http.MethodPost, "/apis/"+want.GroupVersion().String(), tc.info, runtime.ContentTypeProtobuf, body)
+			w := serve(NewFactory().Create(tc.info), http.MethodPost, tc.path, tc.info, runtime.ContentTypeProtobuf, protobufBody(t, tc.obj))
 
 			require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 			got := fs.gotContent(t)
@@ -347,4 +359,232 @@ func TestCreateProtobufOtherBuiltInGroups(t *testing.T) {
 			assert.Equal(t, want.Kind, got["kind"])
 		})
 	}
+}
+
+// protobufWithExtraFields encodes raw, an encoded object of the given kind, with
+// fields its type lacks, as a newer client would send them: extra appended to the
+// object, and extraInField to its message field number field.
+func protobufWithExtraFields(t *testing.T, apiVersion, kind string, raw, extra []byte, field protowire.Number, extraInField []byte) []byte {
+	t.Helper()
+	raw = append(raw, extra...)
+	if extraInField != nil {
+		// A singular message field that occurs twice is merged, so this adds to the one already in raw.
+		raw = bytesField(raw, field, extraInField)
+	}
+	body := &bytes.Buffer{}
+	require.NoError(t, protobuf.NewSerializer(kubescheme.Scheme, kubescheme.Scheme).Encode(&runtime.Unknown{
+		TypeMeta: runtime.TypeMeta{APIVersion: apiVersion, Kind: kind},
+		Raw:      raw,
+	}, body))
+	return body.Bytes()
+}
+
+func protobufNodeWithExtraFields(t *testing.T, extra, extraInSpec []byte) []byte {
+	t.Helper()
+	raw, err := (&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n"}}).Marshal()
+	require.NoError(t, err)
+	return protobufWithExtraFields(t, "v1", "Node", raw, extra, 2, extraInSpec)
+}
+
+func bytesField(b []byte, num protowire.Number, v []byte) []byte {
+	b = protowire.AppendTag(b, num, protowire.BytesType)
+	return protowire.AppendBytes(b, v)
+}
+
+func stringField(num protowire.Number, v string) []byte {
+	return bytesField(nil, num, []byte(v))
+}
+
+func varintField(num protowire.Number, v uint64) []byte {
+	b := protowire.AppendTag(nil, num, protowire.VarintType)
+	return protowire.AppendVarint(b, v)
+}
+
+// Decoding a protobuf body into edgecore's types loses the fields they lack, and
+// an update then removes them in the cloud. Such a body is refused, even when the
+// field is 0 or empty: a newer pointer field set to 0 differs from an unset one.
+func TestProtobufRefusesFieldsEdgecoreLacks(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		extra, extraInSpec []byte
+		wantField          string
+	}{
+		{"in the object", stringField(99, "new"), nil, "(field 99)"},
+		{"in a nested message", nil, stringField(99, "new"), "spec.(field 99)"},
+		{"in a message the types lack", stringField(98, string(stringField(1, "new"))), nil, "(field 98)"},
+		{"set to 0", nil, varintField(97, 0), "spec.(field 97)"},
+		{"set to an empty string", stringField(98, ""), nil, "(field 98)"},
+		{"set to an empty message", nil, stringField(99, string(stringField(1, ""))), "spec.(field 99)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFakeStorage(t)
+			w := serve(NewFactory().Update(nodeUpdateInfo("n")), http.MethodPut, "/api/v1/nodes/n",
+				nodeUpdateInfo("n"), runtime.ContentTypeProtobuf, protobufNodeWithExtraFields(t, tc.extra, tc.extraInSpec))
+
+			assert.Equal(t, http.StatusUnsupportedMediaType, w.Code, w.Body.String())
+			assert.Contains(t, w.Body.String(), tc.wantField)
+			assert.Contains(t, w.Body.String(), "send it as JSON")
+			assert.Equal(t, 0, fs.calls)
+		})
+	}
+}
+
+// gogo's decoder skips a group whose end tag names another field, but the check
+// cannot read it. That is the client's error, so 400 rather than 500.
+func TestProtobufMalformedUnknownFieldIsBadRequest(t *testing.T) {
+	extra := protowire.AppendTag(nil, 50, protowire.StartGroupType)
+	extra = protowire.AppendTag(extra, 51, protowire.EndGroupType)
+
+	fs := newFakeStorage(t)
+	w := serve(NewFactory().Update(nodeUpdateInfo("n")), http.MethodPut, "/api/v1/nodes/n",
+		nodeUpdateInfo("n"), runtime.ContentTypeProtobuf, protobufNodeWithExtraFields(t, extra, nil))
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "failed to read the protobuf request body")
+	assert.Equal(t, 0, fs.calls)
+}
+
+// Clients from Kubernetes 1.33 on always send Pod status.observedGeneration and
+// status.conditions[].observedGeneration, which edgecore's types lack. A 0 there
+// loses nothing, so the body is accepted; any other value is refused.
+func TestProtobufAlwaysSentPodFields(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		generation, condGeneration uint64
+		wantField                  string
+	}{
+		{"both 0", 0, 0, ""},
+		{"status set", 3, 0, "status.(field 17)"},
+		{"condition set", 0, 3, "status.conditions.(field 7)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := (&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"}}).Marshal()
+			require.NoError(t, err)
+			cond, err := (&corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue}).Marshal()
+			require.NoError(t, err)
+			cond = append(cond, varintField(7, tc.condGeneration)...)
+			status := append(bytesField(nil, 2, cond), varintField(17, tc.generation)...)
+			info := &request.RequestInfo{IsResourceRequest: true, Verb: "update", APIVersion: "v1", Resource: "pods", Namespace: "default", Name: "p"}
+
+			fs := newFakeStorage(t)
+			w := serve(NewFactory().Update(info), http.MethodPut, "/api/v1/namespaces/default/pods/p",
+				info, runtime.ContentTypeProtobuf, protobufWithExtraFields(t, "v1", "Pod", raw, nil, 3, status))
+
+			if tc.wantField == "" {
+				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+				conditions, _, _ := unstructured.NestedSlice(fs.gotContent(t), "status", "conditions")
+				assert.Len(t, conditions, 1)
+				return
+			}
+			assert.Equal(t, http.StatusUnsupportedMediaType, w.Code, w.Body.String())
+			assert.Contains(t, w.Body.String(), tc.wantField)
+			assert.Equal(t, 0, fs.calls)
+		})
+	}
+}
+
+// Clients from Kubernetes 1.37 on always send CSINode status, which edgecore's
+// types lack. An empty status loses nothing, so the body is accepted.
+func TestProtobufAlwaysSentCSINodeStatus(t *testing.T) {
+	for _, version := range []struct {
+		name string
+		obj  interface{ Marshal() ([]byte, error) }
+	}{
+		{"v1", &storagev1.CSINode{ObjectMeta: metav1.ObjectMeta{Name: "n"}}},
+		{"v1beta1", &storagev1beta1.CSINode{ObjectMeta: metav1.ObjectMeta{Name: "n"}}},
+	} {
+		for _, tc := range []struct {
+			name      string
+			status    []byte
+			wantField string
+		}{
+			{"empty", nil, ""},
+			{"storageHealth set", stringField(1, string(stringField(1, "driver"))), "(field 3)"},
+		} {
+			t.Run(version.name+" "+tc.name, func(t *testing.T) {
+				raw, err := version.obj.Marshal()
+				require.NoError(t, err)
+				info := &request.RequestInfo{IsResourceRequest: true, Verb: "update", APIGroup: "storage.k8s.io", APIVersion: version.name, Resource: "csinodes", Name: "n"}
+
+				fs := newFakeStorage(t)
+				w := serve(NewFactory().Update(info), http.MethodPut, "/apis/storage.k8s.io/"+version.name+"/csinodes/n",
+					info, runtime.ContentTypeProtobuf, protobufWithExtraFields(t, "storage.k8s.io/"+version.name, "CSINode", raw, bytesField(nil, 3, tc.status), 0, nil))
+
+				if tc.wantField == "" {
+					require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+					return
+				}
+				assert.Equal(t, http.StatusUnsupportedMediaType, w.Code, w.Body.String())
+				assert.Contains(t, w.Body.String(), tc.wantField)
+				assert.Equal(t, 0, fs.calls)
+			})
+		}
+	}
+}
+
+// The check needs the descriptor of every message a built-in kind can hold.
+func TestProtobufDescriptorsOfAllBuiltInKinds(t *testing.T) {
+	for gvk, typ := range kubescheme.Scheme.AllKnownTypes() {
+		obj := reflect.New(typ).Interface()
+		if _, ok := obj.(descriptorMessage); !ok {
+			continue // not a protobuf message, so the protobuf decoder cannot produce it
+		}
+		name, err := builtInMessages.messageOf(obj)
+		require.NoError(t, err, gvk.String())
+
+		seen := map[string]bool{}
+		var walk func(name string)
+		walk = func(name string) {
+			if seen[name] {
+				return
+			}
+			seen[name] = true
+			m, err := builtInMessages.lookup(name)
+			require.NoError(t, err, "%v message %s", gvk, name)
+			for _, f := range m.GetField() {
+				if f.GetType() == descriptorpb.FieldDescriptorProto_TYPE_MESSAGE {
+					walk(f.GetTypeName())
+				}
+			}
+		}
+		walk(name)
+	}
+}
+
+// The always-sent fields must name real messages, or they never match.
+func TestProtobufAlwaysSentFieldsNameKnownMessages(t *testing.T) {
+	for _, typ := range kubescheme.Scheme.AllKnownTypes() {
+		if obj, ok := reflect.New(typ).Interface().(descriptorMessage); ok {
+			_, err := builtInMessages.messageOf(obj)
+			require.NoError(t, err)
+		}
+	}
+	for f := range alwaysSentFields {
+		m, err := builtInMessages.lookup(f.message)
+		require.NoError(t, err)
+		assert.Nil(t, fieldByNumber(m, f.number), "%s field %d is now in edgecore's types", f.message, f.number)
+	}
+}
+
+// A failure of the field check is a bug in edgecore, so it is logged as an error.
+func TestProtobufCheckFailureIsLogged(t *testing.T) {
+	patches := gomonkey.ApplyFunc(droppedProtobufFields, func([]byte, runtime.Object) ([]string, error) {
+		return nil, errors.New("no descriptor")
+	})
+	defer patches.Reset()
+	// The limiter is global, so a run with -count would otherwise use it up.
+	limiter := failureErrors
+	failureErrors = rate.NewLimiter(rate.Inf, 0)
+	defer func() { failureErrors = limiter }()
+	var logged string
+	patches.ApplyFunc(klog.Errorf, func(format string, args ...interface{}) { logged = fmt.Sprintf(format, args...) })
+
+	fs := newFakeStorage(t)
+	w := serve(NewFactory().Update(nodeUpdateInfo("n")), http.MethodPut, "/api/v1/nodes/n",
+		nodeUpdateInfo("n"), runtime.ContentTypeProtobuf, protobufNodeWithExtraFields(t, nil, nil))
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+	assert.Contains(t, logged, "failed to convert the protobuf body of PUT /api/v1/nodes/n")
+	assert.Contains(t, logged, "no descriptor")
+	assert.Equal(t, 0, fs.calls)
 }
