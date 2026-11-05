@@ -41,11 +41,13 @@ type messageField struct {
 }
 
 // alwaysSentFields are fields that edgecore's types lack and newer clients send
-// even when 0, because they are not pointers (found by comparing k8s.io/api
-// v0.34.1 with v0.31). Any other such field holds data whenever it is present.
-var alwaysSentFields = map[messageField]bool{
-	{".k8s.io.api.core.v1.PodStatus", 17}:   true, // observedGeneration
-	{".k8s.io.api.core.v1.PodCondition", 7}: true, // observedGeneration
+// even when unset, because they are not pointers (k8s.io/api v0.37.2 against
+// v0.31), with their wire type. Any other such field holds data when present.
+var alwaysSentFields = map[messageField]protowire.Type{
+	{".k8s.io.api.core.v1.PodStatus", 17}:      protowire.VarintType, // observedGeneration
+	{".k8s.io.api.core.v1.PodCondition", 7}:    protowire.VarintType, // observedGeneration
+	{".k8s.io.api.storage.v1.CSINode", 3}:      protowire.BytesType,  // status
+	{".k8s.io.api.storage.v1beta1.CSINode", 3}: protowire.BytesType,  // status
 }
 
 // protoMessages indexes the message descriptors of the built-in types by full
@@ -174,7 +176,7 @@ type malformedBodyError struct{ error }
 
 // droppedFields returns the paths of the fields in b, an encoded message named
 // name, that the message lacks. Decoding would lose them, except an always-sent
-// field that is 0.
+// field that is unset.
 func (p *protoMessages) droppedFields(b []byte, name, path string, dropped []string) ([]string, error) {
 	m, err := p.lookup(name)
 	if err != nil {
@@ -196,7 +198,7 @@ func (p *protoMessages) droppedFields(b []byte, name, path string, dropped []str
 		field := fieldByNumber(m, num)
 		switch {
 		case field == nil:
-			if !alwaysSentFields[messageField{name, num}] || !isZeroVarint(typ, value) {
+			if !isUnsetAlwaysSent(messageField{name, num}, typ, value) {
 				dropped = append(dropped, fmt.Sprintf("%s(field %d)", path, num))
 			}
 		case field.GetType() == descriptorpb.FieldDescriptorProto_TYPE_MESSAGE && typ == protowire.BytesType:
@@ -218,10 +220,20 @@ func fieldByNumber(m *descriptorpb.DescriptorProto, num protowire.Number) *descr
 	return nil
 }
 
-func isZeroVarint(typ protowire.Type, value []byte) bool {
-	if typ != protowire.VarintType {
+// isUnsetAlwaysSent reports whether value is an always-sent field of its listed
+// wire type holding what an unset field encodes to: a varint 0 or an empty message.
+func isUnsetAlwaysSent(f messageField, typ protowire.Type, value []byte) bool {
+	want, ok := alwaysSentFields[f]
+	if !ok || typ != want {
 		return false
 	}
-	v, n := protowire.ConsumeVarint(value)
-	return n > 0 && v == 0
+	switch typ {
+	case protowire.VarintType:
+		v, n := protowire.ConsumeVarint(value)
+		return n > 0 && v == 0
+	case protowire.BytesType:
+		v, n := protowire.ConsumeBytes(value)
+		return n > 0 && len(v) == 0
+	}
+	return false
 }

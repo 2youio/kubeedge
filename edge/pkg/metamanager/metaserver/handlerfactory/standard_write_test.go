@@ -30,11 +30,14 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/types/descriptorpb"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	storagev1beta1 "k8s.io/api/storage/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -361,7 +364,7 @@ func TestCreateProtobufOtherBuiltInGroups(t *testing.T) {
 // protobufWithExtraFields encodes raw, an encoded object of the given kind, with
 // fields its type lacks, as a newer client would send them: extra appended to the
 // object, and extraInField to its message field number field.
-func protobufWithExtraFields(t *testing.T, kind string, raw, extra []byte, field protowire.Number, extraInField []byte) []byte {
+func protobufWithExtraFields(t *testing.T, apiVersion, kind string, raw, extra []byte, field protowire.Number, extraInField []byte) []byte {
 	t.Helper()
 	raw = append(raw, extra...)
 	if extraInField != nil {
@@ -370,7 +373,7 @@ func protobufWithExtraFields(t *testing.T, kind string, raw, extra []byte, field
 	}
 	body := &bytes.Buffer{}
 	require.NoError(t, protobuf.NewSerializer(kubescheme.Scheme, kubescheme.Scheme).Encode(&runtime.Unknown{
-		TypeMeta: runtime.TypeMeta{APIVersion: "v1", Kind: kind},
+		TypeMeta: runtime.TypeMeta{APIVersion: apiVersion, Kind: kind},
 		Raw:      raw,
 	}, body))
 	return body.Bytes()
@@ -380,7 +383,7 @@ func protobufNodeWithExtraFields(t *testing.T, extra, extraInSpec []byte) []byte
 	t.Helper()
 	raw, err := (&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n"}}).Marshal()
 	require.NoError(t, err)
-	return protobufWithExtraFields(t, "Node", raw, extra, 2, extraInSpec)
+	return protobufWithExtraFields(t, "v1", "Node", raw, extra, 2, extraInSpec)
 }
 
 func bytesField(b []byte, num protowire.Number, v []byte) []byte {
@@ -465,7 +468,7 @@ func TestProtobufAlwaysSentPodFields(t *testing.T) {
 
 			fs := newFakeStorage(t)
 			w := serve(NewFactory().Update(info), http.MethodPut, "/api/v1/namespaces/default/pods/p",
-				info, runtime.ContentTypeProtobuf, protobufWithExtraFields(t, "Pod", raw, nil, 3, status))
+				info, runtime.ContentTypeProtobuf, protobufWithExtraFields(t, "v1", "Pod", raw, nil, 3, status))
 
 			if tc.wantField == "" {
 				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -477,6 +480,45 @@ func TestProtobufAlwaysSentPodFields(t *testing.T) {
 			assert.Contains(t, w.Body.String(), tc.wantField)
 			assert.Equal(t, 0, fs.calls)
 		})
+	}
+}
+
+// Clients from Kubernetes 1.37 on always send CSINode status, which edgecore's
+// types lack. An empty status loses nothing, so the body is accepted.
+func TestProtobufAlwaysSentCSINodeStatus(t *testing.T) {
+	for _, version := range []struct {
+		name string
+		obj  interface{ Marshal() ([]byte, error) }
+	}{
+		{"v1", &storagev1.CSINode{ObjectMeta: metav1.ObjectMeta{Name: "n"}}},
+		{"v1beta1", &storagev1beta1.CSINode{ObjectMeta: metav1.ObjectMeta{Name: "n"}}},
+	} {
+		for _, tc := range []struct {
+			name      string
+			status    []byte
+			wantField string
+		}{
+			{"empty", nil, ""},
+			{"storageHealth set", stringField(1, string(stringField(1, "driver"))), "(field 3)"},
+		} {
+			t.Run(version.name+" "+tc.name, func(t *testing.T) {
+				raw, err := version.obj.Marshal()
+				require.NoError(t, err)
+				info := &request.RequestInfo{IsResourceRequest: true, Verb: "update", APIGroup: "storage.k8s.io", APIVersion: version.name, Resource: "csinodes", Name: "n"}
+
+				fs := newFakeStorage(t)
+				w := serve(NewFactory().Update(info), http.MethodPut, "/apis/storage.k8s.io/"+version.name+"/csinodes/n",
+					info, runtime.ContentTypeProtobuf, protobufWithExtraFields(t, "storage.k8s.io/"+version.name, "CSINode", raw, bytesField(nil, 3, tc.status), 0, nil))
+
+				if tc.wantField == "" {
+					require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+					return
+				}
+				assert.Equal(t, http.StatusUnsupportedMediaType, w.Code, w.Body.String())
+				assert.Contains(t, w.Body.String(), tc.wantField)
+				assert.Equal(t, 0, fs.calls)
+			})
+		}
 	}
 }
 
@@ -511,8 +553,12 @@ func TestProtobufDescriptorsOfAllBuiltInKinds(t *testing.T) {
 
 // The always-sent fields must name real messages, or they never match.
 func TestProtobufAlwaysSentFieldsNameKnownMessages(t *testing.T) {
-	_, err := builtInMessages.messageOf(&corev1.Pod{})
-	require.NoError(t, err)
+	for _, typ := range kubescheme.Scheme.AllKnownTypes() {
+		if obj, ok := reflect.New(typ).Interface().(descriptorMessage); ok {
+			_, err := builtInMessages.messageOf(obj)
+			require.NoError(t, err)
+		}
+	}
 	for f := range alwaysSentFields {
 		m, err := builtInMessages.lookup(f.message)
 		require.NoError(t, err)
@@ -526,6 +572,10 @@ func TestProtobufCheckFailureIsLogged(t *testing.T) {
 		return nil, errors.New("no descriptor")
 	})
 	defer patches.Reset()
+	// The limiter is global, so a run with -count would otherwise use it up.
+	limiter := failureErrors
+	failureErrors = rate.NewLimiter(rate.Inf, 0)
+	defer func() { failureErrors = limiter }()
 	var logged string
 	patches.ApplyFunc(klog.Errorf, func(format string, args ...interface{}) { logged = fmt.Sprintf(format, args...) })
 
