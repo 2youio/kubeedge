@@ -21,6 +21,7 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"reflect"
 	"sync"
 
 	gogoproto "github.com/gogo/protobuf/proto"
@@ -34,51 +35,78 @@ type descriptorMessage interface {
 	Descriptor() ([]byte, []int)
 }
 
+type messageField struct {
+	message string
+	number  protowire.Number
+}
+
+// alwaysSentFields are fields that edgecore's types lack and newer clients send
+// even when 0, because they are not pointers (found by comparing k8s.io/api
+// v0.34.1 with v0.31). Any other such field holds data whenever it is present.
+var alwaysSentFields = map[messageField]bool{
+	{".k8s.io.api.core.v1.PodStatus", 17}:   true, // observedGeneration
+	{".k8s.io.api.core.v1.PodCondition", 7}: true, // observedGeneration
+}
+
 // protoMessages indexes the message descriptors of the built-in types by full
 // name, such as ".k8s.io.api.core.v1.Node". Files are loaded on first use.
 type protoMessages struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	files    map[string]bool
 	messages map[string]*descriptorpb.DescriptorProto
+	types    map[reflect.Type]string
 }
 
 var builtInMessages = &protoMessages{
 	files:    map[string]bool{},
 	messages: map[string]*descriptorpb.DescriptorProto{},
+	types:    map[reflect.Type]string{},
 }
 
-// messageOf returns the descriptor of obj's protobuf message.
-func (p *protoMessages) messageOf(obj interface{}) (*descriptorpb.DescriptorProto, error) {
+// messageOf returns the full name of obj's protobuf message.
+func (p *protoMessages) messageOf(obj interface{}) (string, error) {
+	t := reflect.TypeOf(obj)
+	p.mu.RLock()
+	name, ok := p.types[t]
+	p.mu.RUnlock()
+	if ok {
+		return name, nil
+	}
+
 	d, ok := obj.(descriptorMessage)
 	if !ok {
-		return nil, fmt.Errorf("%T has no protobuf descriptor", obj)
+		return "", fmt.Errorf("%T has no protobuf descriptor", obj)
 	}
 	gz, path := d.Descriptor()
 	fd, err := parseFileDescriptor(gz)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.load(fd); err != nil {
-		return nil, err
+		return "", err
 	}
-	name := "." + fd.GetPackage()
+	name = "." + fd.GetPackage()
 	messages := fd.GetMessageType()
 	for _, i := range path {
 		if i < 0 || i >= len(messages) {
-			return nil, fmt.Errorf("bad descriptor path %v for %T", path, obj)
+			return "", fmt.Errorf("bad descriptor path %v for %T", path, obj)
 		}
 		name += "." + messages[i].GetName()
 		messages = messages[i].GetNestedType()
 	}
-	return p.messages[name], nil
+	if _, ok := p.messages[name]; !ok {
+		return "", fmt.Errorf("no protobuf descriptor for message %s of %T", name, obj)
+	}
+	p.types[t] = name
+	return name, nil
 }
 
 func (p *protoMessages) lookup(name string) (*descriptorpb.DescriptorProto, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	m, ok := p.messages[name]
 	if !ok {
 		return nil, fmt.Errorf("no protobuf descriptor for message %s", name)
@@ -139,10 +167,14 @@ func parseFileDescriptor(gz []byte) (*descriptorpb.FileDescriptorProto, error) {
 	return fd, nil
 }
 
-// droppedFields returns the paths of the fields in b, an encoded message of type
-// m, that m lacks and that hold a value. Decoding into m would lose them. A
-// lacking field with a zero value is skipped: newer clients always send some.
-func (p *protoMessages) droppedFields(b []byte, m *descriptorpb.DescriptorProto, path string, dropped []string) ([]string, error) {
+// droppedFields returns the paths of the fields in b, an encoded message named
+// name, that the message lacks. Decoding would lose them, except an always-sent
+// field that is 0.
+func (p *protoMessages) droppedFields(b []byte, name, path string, dropped []string) ([]string, error) {
+	m, err := p.lookup(name)
+	if err != nil {
+		return nil, err
+	}
 	for len(b) > 0 {
 		num, typ, n := protowire.ConsumeTag(b)
 		if n < 0 {
@@ -159,16 +191,12 @@ func (p *protoMessages) droppedFields(b []byte, m *descriptorpb.DescriptorProto,
 		field := fieldByNumber(m, num)
 		switch {
 		case field == nil:
-			if !isZeroValue(typ, value) {
+			if !alwaysSentFields[messageField{name, num}] || !isZeroVarint(typ, value) {
 				dropped = append(dropped, fmt.Sprintf("%s(field %d)", path, num))
 			}
 		case field.GetType() == descriptorpb.FieldDescriptorProto_TYPE_MESSAGE && typ == protowire.BytesType:
-			fieldMessage, err := p.lookup(field.GetTypeName())
-			if err != nil {
-				return nil, err
-			}
 			inner, _ := protowire.ConsumeBytes(value)
-			if dropped, err = p.droppedFields(inner, fieldMessage, path+field.GetName()+".", dropped); err != nil {
+			if dropped, err = p.droppedFields(inner, field.GetTypeName(), path+field.GetName()+".", dropped); err != nil {
 				return nil, err
 			}
 		}
@@ -185,34 +213,10 @@ func fieldByNumber(m *descriptorpb.DescriptorProto, num protowire.Number) *descr
 	return nil
 }
 
-// isZeroValue reports whether a field value is 0, empty, or a message whose
-// fields are all zero. Without the schema an empty string and an empty message look alike.
-func isZeroValue(typ protowire.Type, value []byte) bool {
-	switch typ {
-	case protowire.VarintType:
-		v, _ := protowire.ConsumeVarint(value)
-		return v == 0
-	case protowire.Fixed32Type:
-		v, _ := protowire.ConsumeFixed32(value)
-		return v == 0
-	case protowire.Fixed64Type:
-		v, _ := protowire.ConsumeFixed64(value)
-		return v == 0
-	case protowire.BytesType:
-		inner, _ := protowire.ConsumeBytes(value)
-		for len(inner) > 0 {
-			num, innerTyp, n := protowire.ConsumeTag(inner)
-			if n < 0 {
-				return false
-			}
-			inner = inner[n:]
-			n = protowire.ConsumeFieldValue(num, innerTyp, inner)
-			if n < 0 || !isZeroValue(innerTyp, inner[:n]) {
-				return false
-			}
-			inner = inner[n:]
-		}
-		return true
+func isZeroVarint(typ protowire.Type, value []byte) bool {
+	if typ != protowire.VarintType {
+		return false
 	}
-	return false
+	v, n := protowire.ConsumeVarint(value)
+	return n > 0 && v == 0
 }

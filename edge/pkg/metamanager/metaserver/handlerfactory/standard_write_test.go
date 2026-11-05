@@ -356,33 +356,48 @@ func TestCreateProtobufOtherBuiltInGroups(t *testing.T) {
 	}
 }
 
-// protobufNodeWithExtraFields encodes a Node with fields its type lacks, as a
-// newer client would send them: extra appended to the Node, and extraInSpec to its spec.
-func protobufNodeWithExtraFields(t *testing.T, name string, extra, extraInSpec []byte) []byte {
+// protobufWithExtraFields encodes raw, an encoded object of the given kind, with
+// fields its type lacks, as a newer client would send them: extra appended to the
+// object, and extraInField to its message field number field.
+func protobufWithExtraFields(t *testing.T, kind string, raw, extra []byte, field protowire.Number, extraInField []byte) []byte {
 	t.Helper()
-	raw, err := (&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}).Marshal()
-	require.NoError(t, err)
 	raw = append(raw, extra...)
-	if extraInSpec != nil {
-		// A repeated message field is merged, so this adds to the spec already in raw.
-		raw = protowire.AppendTag(raw, 2, protowire.BytesType)
-		raw = protowire.AppendBytes(raw, extraInSpec)
+	if extraInField != nil {
+		// A singular message field that occurs twice is merged, so this adds to the one already in raw.
+		raw = bytesField(raw, field, extraInField)
 	}
 	body := &bytes.Buffer{}
 	require.NoError(t, protobuf.NewSerializer(kubescheme.Scheme, kubescheme.Scheme).Encode(&runtime.Unknown{
-		TypeMeta: runtime.TypeMeta{APIVersion: "v1", Kind: "Node"},
+		TypeMeta: runtime.TypeMeta{APIVersion: "v1", Kind: kind},
 		Raw:      raw,
 	}, body))
 	return body.Bytes()
 }
 
+func protobufNodeWithExtraFields(t *testing.T, extra, extraInSpec []byte) []byte {
+	t.Helper()
+	raw, err := (&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n"}}).Marshal()
+	require.NoError(t, err)
+	return protobufWithExtraFields(t, "Node", raw, extra, 2, extraInSpec)
+}
+
+func bytesField(b []byte, num protowire.Number, v []byte) []byte {
+	b = protowire.AppendTag(b, num, protowire.BytesType)
+	return protowire.AppendBytes(b, v)
+}
+
 func stringField(num protowire.Number, v string) []byte {
-	b := protowire.AppendTag(nil, num, protowire.BytesType)
-	return protowire.AppendString(b, v)
+	return bytesField(nil, num, []byte(v))
+}
+
+func varintField(num protowire.Number, v uint64) []byte {
+	b := protowire.AppendTag(nil, num, protowire.VarintType)
+	return protowire.AppendVarint(b, v)
 }
 
 // Decoding a protobuf body into edgecore's types loses the fields they lack, and
-// an update then removes them in the cloud. Such a body is refused.
+// an update then removes them in the cloud. Such a body is refused, even when the
+// field is 0 or empty: a newer pointer field set to 0 differs from an unset one.
 func TestProtobufRefusesFieldsEdgecoreLacks(t *testing.T) {
 	for _, tc := range []struct {
 		name               string
@@ -392,11 +407,14 @@ func TestProtobufRefusesFieldsEdgecoreLacks(t *testing.T) {
 		{"in the object", stringField(99, "new"), nil, "(field 99)"},
 		{"in a nested message", nil, stringField(99, "new"), "spec.(field 99)"},
 		{"in a message the types lack", stringField(98, string(stringField(1, "new"))), nil, "(field 98)"},
+		{"set to 0", nil, varintField(97, 0), "spec.(field 97)"},
+		{"set to an empty string", stringField(98, ""), nil, "(field 98)"},
+		{"set to an empty message", nil, stringField(99, string(stringField(1, ""))), "spec.(field 99)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := newFakeStorage(t)
 			w := serve(NewFactory().Update(nodeUpdateInfo("n")), http.MethodPut, "/api/v1/nodes/n",
-				nodeUpdateInfo("n"), runtime.ContentTypeProtobuf, protobufNodeWithExtraFields(t, "n", tc.extra, tc.extraInSpec))
+				nodeUpdateInfo("n"), runtime.ContentTypeProtobuf, protobufNodeWithExtraFields(t, tc.extra, tc.extraInSpec))
 
 			assert.Equal(t, http.StatusUnsupportedMediaType, w.Code, w.Body.String())
 			assert.Contains(t, w.Body.String(), tc.wantField)
@@ -406,21 +424,43 @@ func TestProtobufRefusesFieldsEdgecoreLacks(t *testing.T) {
 	}
 }
 
-// Newer clients always send some fields edgecore's types lack, empty or 0.
-// Dropping those loses nothing, so the body is accepted.
-func TestProtobufAcceptsZeroFieldsEdgecoreLacks(t *testing.T) {
-	var extra []byte
-	extra = protowire.AppendTag(extra, 97, protowire.VarintType)
-	extra = protowire.AppendVarint(extra, 0)
-	extra = append(extra, stringField(98, "")...)
-	extra = append(extra, stringField(99, string(stringField(1, "")))...)
+// Clients from Kubernetes 1.33 on always send Pod status.observedGeneration and
+// status.conditions[].observedGeneration, which edgecore's types lack. A 0 there
+// loses nothing, so the body is accepted; any other value is refused.
+func TestProtobufAlwaysSentPodFields(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		generation, condGeneration uint64
+		wantField                  string
+	}{
+		{"both 0", 0, 0, ""},
+		{"status set", 3, 0, "status.(field 17)"},
+		{"condition set", 0, 3, "status.conditions.(field 7)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := (&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"}}).Marshal()
+			require.NoError(t, err)
+			cond, err := (&corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue}).Marshal()
+			require.NoError(t, err)
+			cond = append(cond, varintField(7, tc.condGeneration)...)
+			status := append(bytesField(nil, 2, cond), varintField(17, tc.generation)...)
+			info := &request.RequestInfo{IsResourceRequest: true, Verb: "update", APIVersion: "v1", Resource: "pods", Namespace: "default", Name: "p"}
 
-	fs := newFakeStorage(t)
-	w := serve(NewFactory().Update(nodeUpdateInfo("n")), http.MethodPut, "/api/v1/nodes/n",
-		nodeUpdateInfo("n"), runtime.ContentTypeProtobuf, protobufNodeWithExtraFields(t, "n", extra, extra))
+			fs := newFakeStorage(t)
+			w := serve(NewFactory().Update(info), http.MethodPut, "/api/v1/namespaces/default/pods/p",
+				info, runtime.ContentTypeProtobuf, protobufWithExtraFields(t, "Pod", raw, nil, 3, status))
 
-	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	assert.Equal(t, "Node", fs.gotContent(t)["kind"])
+			if tc.wantField == "" {
+				require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+				conditions, _, _ := unstructured.NestedSlice(fs.gotContent(t), "status", "conditions")
+				assert.Len(t, conditions, 1)
+				return
+			}
+			assert.Equal(t, http.StatusUnsupportedMediaType, w.Code, w.Body.String())
+			assert.Contains(t, w.Body.String(), tc.wantField)
+			assert.Equal(t, 0, fs.calls)
+		})
+	}
 }
 
 // The check needs the descriptor of every message a built-in kind can hold.
@@ -430,26 +470,35 @@ func TestProtobufDescriptorsOfAllBuiltInKinds(t *testing.T) {
 		if _, ok := obj.(descriptorMessage); !ok {
 			continue // not a protobuf message, so the protobuf decoder cannot produce it
 		}
-		m, err := builtInMessages.messageOf(obj)
+		name, err := builtInMessages.messageOf(obj)
 		require.NoError(t, err, gvk.String())
-		require.NotNil(t, m, gvk.String())
 
 		seen := map[string]bool{}
-		var walk func(name string, m *descriptorpb.DescriptorProto)
-		walk = func(name string, m *descriptorpb.DescriptorProto) {
+		var walk func(name string)
+		walk = func(name string) {
 			if seen[name] {
 				return
 			}
 			seen[name] = true
+			m, err := builtInMessages.lookup(name)
+			require.NoError(t, err, "%v message %s", gvk, name)
 			for _, f := range m.GetField() {
-				if f.GetType() != descriptorpb.FieldDescriptorProto_TYPE_MESSAGE {
-					continue
+				if f.GetType() == descriptorpb.FieldDescriptorProto_TYPE_MESSAGE {
+					walk(f.GetTypeName())
 				}
-				fm, err := builtInMessages.lookup(f.GetTypeName())
-				require.NoError(t, err, "%v field %s", gvk, f.GetName())
-				walk(f.GetTypeName(), fm)
 			}
 		}
-		walk(gvk.String(), m)
+		walk(name)
+	}
+}
+
+// The always-sent fields must name real messages, or they never match.
+func TestProtobufAlwaysSentFieldsNameKnownMessages(t *testing.T) {
+	_, err := builtInMessages.messageOf(&corev1.Pod{})
+	require.NoError(t, err)
+	for f := range alwaysSentFields {
+		m, err := builtInMessages.lookup(f.message)
+		require.NoError(t, err)
+		assert.Nil(t, fieldByNumber(m, f.number), "%s field %d is now in edgecore's types", f.message, f.number)
 	}
 }

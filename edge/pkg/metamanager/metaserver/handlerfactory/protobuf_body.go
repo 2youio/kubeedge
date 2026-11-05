@@ -23,7 +23,9 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+	"time"
 
+	"golang.org/x/time/rate"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -113,11 +115,11 @@ func droppedProtobufFields(body []byte, obj runtime.Object) ([]string, error) {
 	if _, _, err := protobufDecoder.Decode(body, nil, envelope); err != nil {
 		return nil, err
 	}
-	m, err := builtInMessages.messageOf(obj)
+	name, err := builtInMessages.messageOf(obj)
 	if err != nil {
 		return nil, err
 	}
-	return builtInMessages.droppedFields(envelope.Raw, m, "", nil)
+	return builtInMessages.droppedFields(envelope.Raw, name, "", nil)
 }
 
 // kindName gives "v1 Node" rather than "/v1, Kind=Node".
@@ -128,8 +130,15 @@ func kindName(gvk *schema.GroupVersionKind) string {
 	return gvk.GroupVersion().String() + " " + gvk.Kind
 }
 
+// A client retries a refused write, so warnings are limited to a few per minute.
+var refusalWarnings = rate.NewLimiter(rate.Every(20*time.Second), 3)
+
 func unsupportedProtobuf(message string) error {
-	klog.Warningf("MetaServer refused a protobuf request body: %s", message)
+	if refusalWarnings.Allow() {
+		klog.Warningf("MetaServer refused a protobuf request body: %s", message)
+	} else {
+		klog.V(4).Infof("MetaServer refused a protobuf request body: %s", message)
+	}
 	return &errors.StatusError{ErrStatus: metav1.Status{
 		Status:  metav1.StatusFailure,
 		Code:    http.StatusUnsupportedMediaType,
