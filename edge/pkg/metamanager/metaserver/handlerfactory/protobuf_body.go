@@ -49,10 +49,6 @@ var (
 // on as JSON. Requests with any other content type pass through untouched.
 func protobufToJSON(s *handlers.RequestScope, newHandler func(*handlers.RequestScope) http.Handler) http.Handler {
 	h := newHandler(s)
-	// The limit is checked on the protobuf body; its JSON form is larger.
-	converted := *s
-	converted.MaxRequestBodyBytes = 0
-	hConverted := newHandler(&converted)
 	scope := wrapScope{RequestScope: s}
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		mediaType, _, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
@@ -68,6 +64,9 @@ func protobufToJSON(s *handlers.RequestScope, newHandler func(*handlers.RequestS
 		}
 		jsonBody, err := protobufBodyToJSON(body)
 		if err != nil {
+			if errors.IsUnsupportedMediaType(err) {
+				logRefusal(req, err)
+			}
 			scope.err(err, w, req)
 			return
 		}
@@ -76,8 +75,23 @@ func protobufToJSON(s *handlers.RequestScope, newHandler func(*handlers.RequestS
 		req.Body = io.NopCloser(bytes.NewReader(jsonBody))
 		req.ContentLength = int64(len(jsonBody))
 		req.Header.Set("Content-Type", runtime.ContentTypeJSON)
-		hConverted.ServeHTTP(w, req)
+		// The limit was checked on the protobuf body; its JSON form is larger.
+		converted := *s
+		converted.MaxRequestBodyBytes = 0
+		newHandler(&converted).ServeHTTP(w, req)
 	})
+}
+
+// A client retries a refused write, so warnings are limited to a few per minute.
+var refusalWarnings = rate.NewLimiter(rate.Every(20*time.Second), 3)
+
+func logRefusal(req *http.Request, err error) {
+	msg := fmt.Sprintf("MetaServer refused the protobuf body of %s %s from %q: %v", req.Method, req.URL.Path, req.UserAgent(), err)
+	if refusalWarnings.Allow() {
+		klog.Warning(msg)
+	} else {
+		klog.V(4).Info(msg)
+	}
 }
 
 // protobufBodyToJSON returns API status errors: 415 for a kind or a field that
@@ -94,6 +108,9 @@ func protobufBodyToJSON(body []byte) ([]byte, error) {
 
 	// Decoding skips fields the types lack, and an update would then remove them in the cloud.
 	dropped, err := droppedProtobufFields(body, obj)
+	if _, ok := err.(malformedBodyError); ok {
+		return nil, errors.NewBadRequest(fmt.Sprintf("failed to read the protobuf request body: %v", err))
+	}
 	if err != nil {
 		return nil, errors.NewInternalError(fmt.Errorf("failed to check the %s protobuf request body: %w", kindName(gvk), err))
 	}
@@ -130,15 +147,7 @@ func kindName(gvk *schema.GroupVersionKind) string {
 	return gvk.GroupVersion().String() + " " + gvk.Kind
 }
 
-// A client retries a refused write, so warnings are limited to a few per minute.
-var refusalWarnings = rate.NewLimiter(rate.Every(20*time.Second), 3)
-
 func unsupportedProtobuf(message string) error {
-	if refusalWarnings.Allow() {
-		klog.Warningf("MetaServer refused a protobuf request body: %s", message)
-	} else {
-		klog.V(4).Infof("MetaServer refused a protobuf request body: %s", message)
-	}
 	return &errors.StatusError{ErrStatus: metav1.Status{
 		Status:  metav1.StatusFailure,
 		Code:    http.StatusUnsupportedMediaType,

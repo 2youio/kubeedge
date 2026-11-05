@@ -120,8 +120,6 @@ func (p *protoMessages) load(fd *descriptorpb.FileDescriptorProto) error {
 	if p.files[fd.GetName()] {
 		return nil
 	}
-	p.files[fd.GetName()] = true
-	p.index("."+fd.GetPackage(), fd.GetMessageType())
 	for _, dep := range fd.GetDependency() {
 		if p.files[dep] {
 			continue
@@ -140,6 +138,9 @@ func (p *protoMessages) load(fd *descriptorpb.FileDescriptorProto) error {
 			return err
 		}
 	}
+	// Marked only after its imports loaded, so a failed load is tried again.
+	p.index("."+fd.GetPackage(), fd.GetMessageType())
+	p.files[fd.GetName()] = true
 	return nil
 }
 
@@ -167,6 +168,10 @@ func parseFileDescriptor(gz []byte) (*descriptorpb.FileDescriptorProto, error) {
 	return fd, nil
 }
 
+// malformedBodyError is a body that gogo's decoder skipped through but protowire
+// rejects, such as a group whose end tag names another field.
+type malformedBodyError struct{ error }
+
 // droppedFields returns the paths of the fields in b, an encoded message named
 // name, that the message lacks. Decoding would lose them, except an always-sent
 // field that is 0.
@@ -178,12 +183,12 @@ func (p *protoMessages) droppedFields(b []byte, name, path string, dropped []str
 	for len(b) > 0 {
 		num, typ, n := protowire.ConsumeTag(b)
 		if n < 0 {
-			return nil, protowire.ParseError(n)
+			return nil, malformedBodyError{protowire.ParseError(n)}
 		}
 		b = b[n:]
 		n = protowire.ConsumeFieldValue(num, typ, b)
 		if n < 0 {
-			return nil, protowire.ParseError(n)
+			return nil, malformedBodyError{protowire.ParseError(n)}
 		}
 		value := b[:n]
 		b = b[n:]

@@ -424,6 +424,21 @@ func TestProtobufRefusesFieldsEdgecoreLacks(t *testing.T) {
 	}
 }
 
+// gogo's decoder skips a group whose end tag names another field, but the check
+// cannot read it. That is the client's error, so 400 rather than 500.
+func TestProtobufMalformedUnknownFieldIsBadRequest(t *testing.T) {
+	extra := protowire.AppendTag(nil, 50, protowire.StartGroupType)
+	extra = protowire.AppendTag(extra, 51, protowire.EndGroupType)
+
+	fs := newFakeStorage(t)
+	w := serve(NewFactory().Update(nodeUpdateInfo("n")), http.MethodPut, "/api/v1/nodes/n",
+		nodeUpdateInfo("n"), runtime.ContentTypeProtobuf, protobufNodeWithExtraFields(t, extra, nil))
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "failed to read the protobuf request body")
+	assert.Equal(t, 0, fs.calls)
+}
+
 // Clients from Kubernetes 1.33 on always send Pod status.observedGeneration and
 // status.conditions[].observedGeneration, which edgecore's types lack. A 0 there
 // loses nothing, so the body is accepted; any other value is refused.
