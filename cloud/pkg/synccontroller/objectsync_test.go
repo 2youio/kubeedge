@@ -147,6 +147,10 @@ func TestGCOrphanedObjectSync(t *testing.T) {
 			if !reflect.DeepEqual(message.GetResource(), tt.ExpectedResource) {
 				t.Errorf("gcOrphanedObjectSync() = %v, want %v", message.GetResource(), tt.ExpectedResource)
 			}
+			// Only the edge's ACK removes the record, and cloudhub ACKs every kind from this source.
+			if message.GetSource() != modules.DynamicControllerModuleName {
+				t.Errorf("gcOrphanedObjectSync() source = %v, want %v", message.GetSource(), modules.DynamicControllerModuleName)
+			}
 		})
 	}
 }

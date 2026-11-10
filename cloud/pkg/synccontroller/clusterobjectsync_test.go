@@ -37,27 +37,28 @@ import (
 	edgeinformers "github.com/kubeedge/api/client/informers/externalversions"
 	"github.com/kubeedge/beehive/pkg/core/model"
 	"github.com/kubeedge/kubeedge/cloud/pkg/common/informers"
+	"github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
 )
 
 type testFuncBackup struct {
-	originalSendToEdge                     func(string, model.Message)
-	originalBuildEdgeControllerMessageFunc func(string, string, string, string, string, interface{}) *model.Message
-	originalGetNodeNameFunc                func(string) string
-	originalGetObjectUIDFunc               func(string) string
-	originalCompareResourceVersionFunc     func(string, string) int
-	originalGcFunc                         func(*SyncController, *v1alpha1.ClusterObjectSync, metav1.Object)
-	originalDeleteFunc                     func(*SyncController, string) error
+	originalSendToEdge                 func(string, model.Message)
+	originalBuildSyncMessageFunc       func(string, string, string, string, string, interface{}) *model.Message
+	originalGetNodeNameFunc            func(string) string
+	originalGetObjectUIDFunc           func(string) string
+	originalCompareResourceVersionFunc func(string, string) int
+	originalGcFunc                     func(*SyncController, *v1alpha1.ClusterObjectSync, metav1.Object)
+	originalDeleteFunc                 func(*SyncController, string) error
 }
 
 func setupTest() *testFuncBackup {
 	backup := &testFuncBackup{
-		originalSendToEdge:                     sendToEdge,
-		originalBuildEdgeControllerMessageFunc: buildEdgeControllerMessageFunc,
-		originalGetNodeNameFunc:                getNodeNameFunc,
-		originalGetObjectUIDFunc:               getObjectUIDFunc,
-		originalCompareResourceVersionFunc:     compareResourceVersionFunc,
-		originalGcFunc:                         gcOrphanedClusterObjectSyncFunc,
-		originalDeleteFunc:                     deleteClusterObjectSyncFunc,
+		originalSendToEdge:                 sendToEdge,
+		originalBuildSyncMessageFunc:       buildSyncMessageFunc,
+		originalGetNodeNameFunc:            getNodeNameFunc,
+		originalGetObjectUIDFunc:           getObjectUIDFunc,
+		originalCompareResourceVersionFunc: compareResourceVersionFunc,
+		originalGcFunc:                     gcOrphanedClusterObjectSyncFunc,
+		originalDeleteFunc:                 deleteClusterObjectSyncFunc,
 	}
 
 	getNodeNameFunc = mockGetNodeName
@@ -69,7 +70,7 @@ func setupTest() *testFuncBackup {
 
 func (b *testFuncBackup) restore() {
 	sendToEdge = b.originalSendToEdge
-	buildEdgeControllerMessageFunc = b.originalBuildEdgeControllerMessageFunc
+	buildSyncMessageFunc = b.originalBuildSyncMessageFunc
 	getNodeNameFunc = b.originalGetNodeNameFunc
 	getObjectUIDFunc = b.originalGetObjectUIDFunc
 	compareResourceVersionFunc = b.originalCompareResourceVersionFunc
@@ -284,7 +285,7 @@ func TestReconcileClusterObjectSync(t *testing.T) {
 				gcCalled = true
 			}
 
-			buildEdgeControllerMessageFunc = func(nodeID, namespace, resource, resourceID string, operation string, content interface{}) *model.Message {
+			buildSyncMessageFunc = func(nodeID, namespace, resource, resourceID string, operation string, content interface{}) *model.Message {
 				return &model.Message{}
 			}
 
@@ -354,7 +355,7 @@ func TestGcOrphanedClusterObjectSyncFunction(t *testing.T) {
 				sendCalled = true
 			}
 
-			buildEdgeControllerMessageFunc = func(nodeID, namespace, resource, resourceID string, operation string, content interface{}) *model.Message {
+			buildSyncMessageFunc = func(nodeID, namespace, resource, resourceID string, operation string, content interface{}) *model.Message {
 				if tt.sendMessage {
 					return &model.Message{}
 				}
@@ -415,7 +416,7 @@ func TestSendClusterObjectSyncEventDirect(t *testing.T) {
 		sendCalled = true
 	}
 
-	buildEdgeControllerMessageFunc = func(nodeID, namespace, resource, resourceID string, operation string, content interface{}) *model.Message {
+	buildSyncMessageFunc = func(nodeID, namespace, resource, resourceID string, operation string, content interface{}) *model.Message {
 		return &model.Message{}
 	}
 
@@ -533,7 +534,7 @@ func TestGcOrphanedClusterObjectSyncFuncIntegration(t *testing.T) {
 			sendCalled := false
 			deleteCalled := false
 
-			buildEdgeControllerMessageFunc = func(nodeID, namespace, resource, resourceID string, operation string, content interface{}) *model.Message {
+			buildSyncMessageFunc = func(nodeID, namespace, resource, resourceID string, operation string, content interface{}) *model.Message {
 				assert.Equal(t, "node1", nodeID)
 				assert.Equal(t, "pod", resource)
 				assert.Equal(t, "test-pod", resourceID)
@@ -593,6 +594,27 @@ func TestExecuteDeleteClusterObjectSyncFunc(t *testing.T) {
 	ExecuteDeleteClusterObjectSyncFunc()
 }
 
+// The DELETE of a gone Node must be one the edge ACKs, or its ClusterObjectSync is never removed.
+func TestGcOrphanedClusterObjectSyncSendsAckedDelete(t *testing.T) {
+	backup := setupTest()
+	defer backup.restore()
+
+	var sent *model.Message
+	sendToEdge = func(_ string, msg model.Message) { sent = &msg }
+	getNodeNameFunc = getNodeName
+	getObjectUIDFunc = getObjectUID
+
+	sync := createTestSync("edge-0004.12345", "edge-0006", "Node", "v1", "500")
+	(&SyncController{}).gcOrphanedClusterObjectSyncImpl(sync, nil)
+
+	if sent == nil {
+		t.Fatal("no DELETE was sent")
+	}
+	assert.Equal(t, modules.DynamicControllerModuleName, sent.GetSource())
+	assert.Equal(t, model.DeleteOperation, sent.GetOperation())
+	assert.Equal(t, "node/edge-0004/null/node/edge-0006", sent.GetResource())
+}
+
 // The resent DELETE carries a deletionTimestamp a second before the creation of the object
 // recreated under the name, else a second before now, so the edge keeps the objects of a
 // Namespace recreated before or after the resend (KEDEV-834).
@@ -614,7 +636,7 @@ func TestGcOrphanedClusterObjectSyncStampsRecreation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var body *unstructured.Unstructured
-			buildEdgeControllerMessageFunc = func(_, _, _, _ string, _ string, content interface{}) *model.Message {
+			buildSyncMessageFunc = func(_, _, _, _ string, _ string, content interface{}) *model.Message {
 				body = content.(*unstructured.Unstructured)
 				return &model.Message{}
 			}
