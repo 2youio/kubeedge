@@ -237,6 +237,10 @@ func TestSendEvents(t *testing.T) {
 			if !reflect.DeepEqual(message.GetOperation(), tt.ExpectedOperation) {
 				t.Errorf("sendEvents() = %v, want %v", message.GetResource(), tt.ExpectedOperation)
 			}
+			// The resent update must be one the edge ACKs, or its record never moves forward (KEDEV-914).
+			if message.GetSource() != modules.DynamicControllerModuleName {
+				t.Errorf("sendEvents() source = %v, want %v", message.GetSource(), modules.DynamicControllerModuleName)
+			}
 		})
 	}
 }

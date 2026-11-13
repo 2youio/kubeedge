@@ -410,14 +410,9 @@ func TestSendClusterObjectSyncEventDirect(t *testing.T) {
 		return 0
 	}
 
-	sendCalled := false
-
+	var sent *model.Message
 	sendToEdge = func(module string, msg model.Message) {
-		sendCalled = true
-	}
-
-	buildSyncMessageFunc = func(nodeID, namespace, resource, resourceID string, operation string, content interface{}) *model.Message {
-		return &model.Message{}
+		sent = &msg
 	}
 
 	nodeName := "node1"
@@ -428,7 +423,12 @@ func TestSendClusterObjectSyncEventDirect(t *testing.T) {
 
 	sendClusterObjectSyncEvent(nodeName, sync, resourceType, objectResourceVersion, obj)
 
-	assert.True(t, sendCalled, "Send should have been called")
+	if sent == nil {
+		t.Fatal("Send should have been called")
+	}
+	// The resent update must be one the edge ACKs, or its record never moves forward (KEDEV-914).
+	assert.Equal(t, modules.DynamicControllerModuleName, sent.GetSource())
+	assert.Equal(t, model.UpdateOperation, sent.GetOperation())
 }
 
 func TestDeleteClusterObjectSyncFunc(t *testing.T) {

@@ -169,8 +169,8 @@ func sendUpdate(nodeName string, sync *v1alpha1.ObjectSync, resourceType string,
 }
 
 // buildSyncMessage builds a resend of the sync loop. Only the edge's ACK updates or removes the
-// record, and cloudhub sends edgecontroller Node and Lease messages without ACK, so the message
-// goes as dynamiccontroller, which the edge handles the same way (KEDEV-914).
+// record, and cloudhub sends edgecontroller Node, Lease and CSR messages without ACK, so the
+// message goes as dynamiccontroller, which the edge handles the same way (KEDEV-914).
 func buildSyncMessage(nodeName, namespace, resourceType, resourceName, operationType string, obj interface{}) *model.Message {
 	resource, err := messagelayer.BuildResource(nodeName, namespace, resourceType, resourceName)
 	if err != nil {
