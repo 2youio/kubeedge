@@ -31,7 +31,10 @@ type NodeGroupSpec struct {
 	MatchLabels map[string]string `json:"matchLabels,omitempty"`
 
 	// topologyEnabled indicates whether the topology is enabled for this NodeGroup.
+	// Defaults to true. A false is lost whenever a Go client writes the whole object,
+	// as the controller does once to add its finalizer.
 	// +optional
+	// +kubebuilder:default=true
 	TopologyEnabled bool `json:"topologyEnabled,omitempty"`
 }
 
