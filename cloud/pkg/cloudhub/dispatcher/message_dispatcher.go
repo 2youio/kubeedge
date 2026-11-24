@@ -234,6 +234,8 @@ func (md *messageDispatcher) enqueueAckMessage(nodeID string, msg *beehivemodel.
 	nodeMessagePool := md.GetNodeMessagePool(nodeID)
 	nodeQueue := nodeMessagePool.AckMessageQueue
 	nodeStore := nodeMessagePool.AckMessageStore
+	nodeMessagePool.AckMessageLock.Lock()
+	defer nodeMessagePool.AckMessageLock.Unlock()
 
 	messageKey, err := common.AckMessageKeyFunc(msg)
 	if err != nil {
@@ -267,10 +269,21 @@ func (md *messageDispatcher) enqueueAckMessage(nodeID string, msg *beehivemodel.
 	item, exist, _ := nodeStore.GetByKey(messageKey)
 	if exist {
 		msgInStore := item.(*beehivemodel.Message)
-		if isDeleteMessage(msgInStore) ||
-			synccontroller.CompareResourceVersion(msg.GetResourceVersion(), msgInStore.GetResourceVersion()) <= 0 {
-			// If the message resource version is older than the message in store or the operation
-			// for the message in store is delete, The message will be discarded directly.
+		if isDeleteMessage(msgInStore) {
+			// The object was added back to the node after its delete was queued. Send this
+			// message instead of the delete, or after it if the delete is already on the wire.
+			if common.AddsBackAfterDelete(msg, msgInStore) {
+				klog.Infof("message %s %s %s (resourceVersion %s) for node %s replaces pending delete %s (resourceVersion %s)",
+					msg.GetID(), msg.GetOperation(), msg.GetResource(), msg.GetResourceVersion(), nodeID, msgInStore.GetID(), msgInStore.GetResourceVersion())
+				shouldEnqueue = true
+				return
+			}
+			common.DroppedBehindDeleteLogf(msg)("drop message %s %s %s from %s (resourceVersion %s) for node %s: delete %s (resourceVersion %q) of the same object is pending",
+				msg.GetID(), msg.GetOperation(), msg.GetResource(), msg.GetSource(), msg.GetResourceVersion(), nodeID, msgInStore.GetID(), msgInStore.GetResourceVersion())
+			return
+		}
+		// A message not newer than the one in store is discarded.
+		if synccontroller.CompareResourceVersion(msg.GetResourceVersion(), msgInStore.GetResourceVersion()) <= 0 {
 			return
 		}
 		shouldEnqueue = true

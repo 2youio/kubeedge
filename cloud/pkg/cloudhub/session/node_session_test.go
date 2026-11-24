@@ -18,11 +18,13 @@ package session
 
 import (
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/golang/mock/gomock"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/api/apis/reliablesyncs/v1alpha1"
@@ -401,15 +403,32 @@ func TestNodeSessionAckDropsReplacingMessage(t *testing.T) {
 	deleteWithoutRV := tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, ""), "delete")
 	deleteWithRV := tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "4"), "delete")
 	response := tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "3"), beehivemodel.ResponseOperation)
+	pcDelete := tf.FromPolicyController(tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "4"), "delete"))
+	addBack := tf.FromPolicyController(tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "6"), "update"))
+	sameRVAddBack := tf.FromPolicyController(tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "4"), "update"))
+	olderUpdate := tf.FromPolicyController(tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "3"), "update"))
+	terminatingPod := tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "6")
+	terminatingPod.DeletionTimestamp = &metav1.Time{}
+	terminating := tf.FromPolicyController(tf.NewPodMessage(terminatingPod, "update"))
+	// The sync loop resends as dynamiccontroller while a delete waits for an offline node.
+	syncLoop := tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "6"), "update")
+	syncLoop.Router.Source = "dynamiccontroller"
 
 	tests := []struct {
 		name     string
 		inFlight *beehivemodel.Message
 		arriving *beehivemodel.Message
+		// wantResent: the arriving message adds the object back and is sent after the ACK.
+		wantResent bool
 	}{
-		{"delete with resourceVersion arrives while one without waits", deleteWithoutRV, deleteWithRV},
-		{"response arrives while a delete with resourceVersion waits", deleteWithRV, response},
-		{"response arrives while a delete without resourceVersion waits", deleteWithoutRV, response},
+		{"delete with resourceVersion arrives while one without waits", deleteWithoutRV, deleteWithRV, false},
+		{"response arrives while a delete with resourceVersion waits", deleteWithRV, response, false},
+		{"response arrives while a delete without resourceVersion waits", deleteWithoutRV, response, false},
+		{"older update replaces a policycontroller delete", pcDelete, olderUpdate, false},
+		{"update with deletionTimestamp replaces a policycontroller delete", pcDelete, terminating, false},
+		{"sync loop resend replaces a policycontroller delete", pcDelete, syncLoop, false},
+		{"newer policycontroller update replaces its delete", pcDelete, addBack, true},
+		{"policycontroller update with the delete's resourceVersion replaces its delete", pcDelete, sameRVAddBack, true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -440,9 +459,13 @@ func TestNodeSessionAckDropsReplacingMessage(t *testing.T) {
 			enqueueAckMessage(session.nodeMessagePool, test.inFlight)
 			time.Sleep(2 * time.Second)
 
+			want := []string{test.inFlight.GetID()}
+			if test.wantResent {
+				want = append(want, test.arriving.GetID())
+			}
 			lock.Lock()
-			if len(sent) != 1 || sent[0] != test.inFlight.GetID() {
-				t.Errorf("sent %v, want only %s", sent, test.inFlight.GetID())
+			if !reflect.DeepEqual(sent, want) {
+				t.Errorf("sent %v, want %v", sent, want)
 			}
 			lock.Unlock()
 
