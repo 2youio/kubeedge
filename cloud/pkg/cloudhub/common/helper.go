@@ -145,12 +145,24 @@ func NoAckMessageKeyFunc(obj interface{}) (string, error) {
 	return msg.Header.ID, nil
 }
 
-// AddsBackAfterDelete reports whether msg puts back on the node an object whose delete is
-// pending: policycontroller sent both (the sync loop resends as dynamiccontroller), and msg
-// inserts or updates the object, not terminating, at the delete's resourceVersion or newer.
+// AddsBackAfterDelete reports whether msg, from policycontroller, puts back on the node an
+// object whose delete is pending. The sync loop resends as dynamiccontroller while a delete
+// waits for an offline node, and that resend must not replace the delete.
 func AddsBackAfterDelete(msg, pendingDelete *beehivemodel.Message) bool {
-	if msg.GetSource() != modules.PolicyControllerModuleName ||
-		pendingDelete.GetSource() != modules.PolicyControllerModuleName {
+	return msg.GetSource() == modules.PolicyControllerModuleName && addsBack(msg, pendingDelete)
+}
+
+// KeepAfterDeleteAck reports whether stored, which replaced ackedDelete in the store, is sent
+// after it. Only an add-back from policycontroller can replace such a delete, so stored may be
+// from any source: a sync loop resend replaces the add-back with a newer resourceVersion.
+func KeepAfterDeleteAck(stored, ackedDelete *beehivemodel.Message) bool {
+	return addsBack(stored, ackedDelete)
+}
+
+// addsBack: policycontroller sent the delete, and msg inserts or updates the object, not
+// terminating, at the delete's resourceVersion or newer.
+func addsBack(msg, pendingDelete *beehivemodel.Message) bool {
+	if pendingDelete.GetSource() != modules.PolicyControllerModuleName {
 		return false
 	}
 	switch msg.GetOperation() {
@@ -164,6 +176,8 @@ func AddsBackAfterDelete(msg, pendingDelete *beehivemodel.Message) bool {
 	if err != nil {
 		return false
 	}
+	// policycontroller always sets the resourceVersion. A delete without one comes from the
+	// sync loop for an object gone from K8s, and the source check above already rejects it.
 	deleteRV, err := strconv.ParseUint(pendingDelete.GetResourceVersion(), 10, 64)
 	if err != nil {
 		return false

@@ -33,6 +33,7 @@ import (
 	beehivemodel "github.com/kubeedge/beehive/pkg/core/model"
 	"github.com/kubeedge/kubeedge/cloud/pkg/cloudhub/common"
 	tf "github.com/kubeedge/kubeedge/cloud/pkg/cloudhub/common/testing"
+	"github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
 	mockcon "github.com/kubeedge/kubeedge/pkg/viaduct/pkg/conn/testing"
 )
 
@@ -410,9 +411,10 @@ func TestNodeSessionAckDropsReplacingMessage(t *testing.T) {
 	terminatingPod := tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "6")
 	terminatingPod.DeletionTimestamp = &metav1.Time{}
 	terminating := tf.FromPolicyController(tf.NewPodMessage(terminatingPod, "update"))
-	// The sync loop resends as dynamiccontroller while a delete waits for an offline node.
-	syncLoop := tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "6"), "update")
-	syncLoop.Router.Source = "dynamiccontroller"
+	// The sync loop resends as dynamiccontroller. Over a policycontroller delete it can only
+	// replace an add-back, since enqueueAckMessage drops it otherwise.
+	syncLoop := tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "7"), "update")
+	syncLoop.Router.Source = modules.DynamicControllerModuleName
 
 	tests := []struct {
 		name     string
@@ -426,7 +428,7 @@ func TestNodeSessionAckDropsReplacingMessage(t *testing.T) {
 		{"response arrives while a delete without resourceVersion waits", deleteWithoutRV, response, false},
 		{"older update replaces a policycontroller delete", pcDelete, olderUpdate, false},
 		{"update with deletionTimestamp replaces a policycontroller delete", pcDelete, terminating, false},
-		{"sync loop resend replaces a policycontroller delete", pcDelete, syncLoop, false},
+		{"sync loop resend replaces the add-back of a policycontroller delete", pcDelete, syncLoop, true},
 		{"newer policycontroller update replaces its delete", pcDelete, addBack, true},
 		{"policycontroller update with the delete's resourceVersion replaces its delete", pcDelete, sameRVAddBack, true},
 	}

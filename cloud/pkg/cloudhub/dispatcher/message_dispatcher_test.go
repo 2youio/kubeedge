@@ -185,7 +185,9 @@ func TestEnqueueAckMessage(t *testing.T) {
 	addBackMsg := tf.FromPolicyController(tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "6"), "update"))
 	sameRVAddBackMsg := tf.FromPolicyController(tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "4"), "update"))
 	olderPCUpdateMsg := tf.FromPolicyController(tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "2"), "update"))
-	pcDeleteWithoutRV := tf.FromPolicyController(newPodDeleteWithoutRVMessage(tf.TestPodName, tf.TestPodUID))
+	// policycontroller always sets the resourceVersion; a delete without one is the sync loop's.
+	syncLoopDeleteWithoutRV := newPodDeleteWithoutRVMessage(tf.TestPodName, tf.TestPodUID)
+	syncLoopDeleteWithoutRV.Router.Source = modules.DynamicControllerModuleName
 	// The sync loop resends as dynamiccontroller while a delete waits for an offline node.
 	syncLoopMsg := tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "6"), "update")
 	syncLoopMsg.Router.Source = modules.DynamicControllerModuleName
@@ -421,17 +423,17 @@ func TestEnqueueAckMessage(t *testing.T) {
 			ExpectedStoreMessage: deleteMsg,
 		},
 		{
-			Name: "update from policycontroller arrives while its delete without resourceVersion waits in store",
+			Name: "update from policycontroller arrives while a sync loop delete without resourceVersion waits in store",
 			InitialObjectSyncs: []*v1alpha1.ObjectSync{
 				tf.NewObjectSync(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "2"), "Pod"),
 			},
 			ReactorErrors:        tf.NoErrors,
-			InitialMessages:      []*beehivemodel.Message{pcDeleteWithoutRV},
+			InitialMessages:      []*beehivemodel.Message{syncLoopDeleteWithoutRV},
 			CurrentArriveMessage: addBackMsg,
 			ExpectedObjectSyncs: []*v1alpha1.ObjectSync{
 				tf.NewObjectSync(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "2"), "Pod"),
 			},
-			ExpectedStoreMessage: pcDeleteWithoutRV,
+			ExpectedStoreMessage: syncLoopDeleteWithoutRV,
 		},
 		{
 			Name: "delete with resourceVersion arrives while one without waits in store",

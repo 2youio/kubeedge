@@ -566,8 +566,8 @@ func (ns *NodeSession) deleteSuccessPoint(resourceNamespace, objectSyncName stri
 }
 
 // removeAckedDelete removes the acknowledged delete msg from the store. A message that replaced
-// it is kept only if it adds the object back; anything else is dropped, see
-// TestNodeSessionAckDropsReplacingMessage.
+// it is kept only if it adds the object back (common.KeepAfterDeleteAck); anything else is
+// dropped, see TestNodeSessionAckDropsReplacingMessage.
 func (ns *NodeSession) removeAckedDelete(msg *beehivemodel.Message) {
 	pool := ns.nodeMessagePool
 	pool.AckMessageLock.Lock()
@@ -579,7 +579,7 @@ func (ns *NodeSession) removeAckedDelete(msg *beehivemodel.Message) {
 	}
 	stored := item.(*beehivemodel.Message)
 	if stored.GetID() != msg.GetID() {
-		if common.AddsBackAfterDelete(stored, msg) {
+		if common.KeepAfterDeleteAck(stored, msg) {
 			klog.Infof("keep message %s %s %s (resourceVersion %s) for node %s after acknowledged delete %s",
 				stored.GetID(), stored.GetOperation(), stored.GetResource(), stored.GetResourceVersion(), ns.nodeID, msg.GetID())
 			return

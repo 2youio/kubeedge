@@ -33,23 +33,30 @@ import (
 	"github.com/kubeedge/kubeedge/cloud/pkg/cloudhub/common"
 	tf "github.com/kubeedge/kubeedge/cloud/pkg/cloudhub/common/testing"
 	"github.com/kubeedge/kubeedge/cloud/pkg/cloudhub/session"
+	"github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
 	mockcon "github.com/kubeedge/kubeedge/pkg/viaduct/pkg/conn/testing"
 )
 
-// KEDEV-1018: a controller sends DELETE for an object to a node, then an UPDATE that adds
-// it back. The UPDATE must reach the node whether it arrives before or after the DELETE's ACK.
+// KEDEV-1018: policycontroller sends DELETE for an object to a node, then an UPDATE that adds
+// it back. The UPDATE, or a newer sync loop resend that replaces it, must reach the node
+// whether it arrives before or after the DELETE's ACK.
 func TestUpdateAfterDeleteReachesEdge(t *testing.T) {
 	tests := []struct {
 		name            string
 		updateBeforeAck bool
+		syncLoopResend  bool
+		wantLast        string
 	}{
-		{"update arrives while the delete waits for its ack", true},
-		{"update arrives after the delete was acked", false},
+		{"update arrives while the delete waits for its ack", true, false, "update/6"},
+		{"sync loop resend replaces the update while the delete waits for its ack", true, true, "update/7"},
+		{"update arrives after the delete was acked", false, false, "update/6"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			deleteMsg := tf.FromPolicyController(tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "4"), "delete"))
 			updateMsg := tf.FromPolicyController(tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "6"), "update"))
+			syncLoopMsg := tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "7"), "update")
+			syncLoopMsg.Router.Source = modules.DynamicControllerModuleName
 
 			client := &fake.Clientset{}
 			initial := []*v1alpha1.ObjectSync{
@@ -87,6 +94,9 @@ func TestUpdateAfterDeleteReachesEdge(t *testing.T) {
 				lock.Unlock()
 				if test.updateBeforeAck && msg.GetID() == deleteMsg.GetID() {
 					dispatcher.enqueueAckMessage(tf.TestNodeID, updateMsg)
+					if test.syncLoopResend {
+						dispatcher.enqueueAckMessage(tf.TestNodeID, syncLoopMsg)
+					}
 				}
 				nodeSession.ReceiveMessageAck(msg.GetID())
 				return nil
@@ -137,9 +147,13 @@ func TestUpdateAfterDeleteReachesEdge(t *testing.T) {
 				waitFor("delete not acknowledged", func() bool {
 					return lastSent() == "delete/4" && len(nmp.AckMessageStore.List()) == 0
 				})
+				// The ACK deleted the ObjectSync; let the lister see that, as the informer would.
+				for _, objectSync := range initial {
+					_ = objectSyncIndexer.Delete(objectSync)
+				}
 				dispatcher.enqueueAckMessage(tf.TestNodeID, updateMsg)
 			}
-			waitFor("update (resourceVersion 6) not sent last", func() bool { return lastSent() == "update/6" })
+			waitFor(test.wantLast+" not sent last", func() bool { return lastSent() == test.wantLast })
 
 			close(stopCh)
 			nodeSession.Terminating()
