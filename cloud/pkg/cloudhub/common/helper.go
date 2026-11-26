@@ -153,8 +153,8 @@ func AddsBackAfterDelete(msg, pendingDelete *beehivemodel.Message) bool {
 }
 
 // KeepAfterDeleteAck reports whether stored, which replaced ackedDelete in the store, is sent
-// after it. Only an add-back from policycontroller can replace such a delete, so stored may be
-// from any source: a sync loop resend replaces the add-back with a newer resourceVersion.
+// after it. A DELETE or a Response may also have replaced it, and addsBack drops those by
+// operation. An add-back is kept from any source: a sync loop resend may have replaced it.
 func KeepAfterDeleteAck(stored, ackedDelete *beehivemodel.Message) bool {
 	return addsBack(stored, ackedDelete)
 }
