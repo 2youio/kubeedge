@@ -101,7 +101,12 @@ func baseKey(name, namespace string, tr *authenticationv1.TokenRequest) string {
 		ref = *tr.Spec.BoundObjectRef
 	}
 
-	return fmt.Sprintf("%q/%q/%#v/%#v/%#v", name, namespace, tr.Spec.Audiences, exp, ref)
+	// No audiences is one key whether the slice is nil or empty.
+	auds := tr.Spec.Audiences
+	if len(auds) == 0 {
+		auds = nil
+	}
+	return fmt.Sprintf("%q/%q/%#v/%#v/%#v", name, namespace, auds, exp, ref)
 }
 
 // KeyFunc returns the per-generation storage key for a TokenRequest. The key
