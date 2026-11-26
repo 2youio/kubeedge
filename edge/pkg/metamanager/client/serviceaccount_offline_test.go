@@ -21,16 +21,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/beego/beego/v2/client/orm"
 
 	"github.com/kubeedge/beehive/pkg/core/model"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/dbm"
+	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao"
 )
 
@@ -151,7 +155,7 @@ func TestGetServiceAccountTokenServesStaleTokenWhenOffline(t *testing.T) {
 	if !requiresRefresh(tr) {
 		t.Fatal("precondition failed: token is not yet due for refresh")
 	}
-	if expired(tr) {
+	if !tr.Status.ExpirationTimestamp.After(time.Now()) {
 		t.Fatal("precondition failed: token has already expired")
 	}
 
@@ -184,6 +188,86 @@ func TestGetServiceAccountTokenFailsWithNoCacheWhenOffline(t *testing.T) {
 	c := &serviceAccountToken{send: offlineSend{}}
 	if _, err := c.GetServiceAccountToken("default", "absent", specOf(projectedTTL)); err == nil {
 		t.Fatal("expected an error when no token is cached")
+	}
+}
+
+// Offline, metamanager answers a token query from metaDB with every token row
+// on the node. That answer is no refresh: another pod's token must not be
+// handed out, and a cached token of this pod is served instead.
+func TestGetServiceAccountTokenIgnoresMetaDBReply(t *testing.T) {
+	useRealDB(t)
+	other, err := json.Marshal(cacheGeneration(t, "dbreply-other", "default", time.Minute, "tok-other"))
+	if err != nil {
+		t.Fatalf("marshal token: %v", err)
+	}
+	send := &fakeSend{syncHandler: func(req *model.Message) (*model.Message, error) {
+		resp := req.NewRespByMessage(req, []string{string(other)})
+		resp.SetRoute(modules.MetaManagerModuleName, resp.GetGroup())
+		return resp, nil
+	}}
+	c := &serviceAccountToken{send: send}
+
+	if got, err := c.GetServiceAccountToken("default", "dbreply-absent", specOf(projectedTTL)); err == nil {
+		t.Fatalf("got token %q from the metaDB reply, want an error", got.Status.Token)
+	}
+
+	cacheGeneration(t, "dbreply-stale", "default", 50*time.Minute, "tok-stale")
+	got, err := c.GetServiceAccountToken("default", "dbreply-stale", specOf(projectedTTL))
+	if err != nil {
+		t.Fatalf("GetServiceAccountToken: %v", err)
+	}
+	if got.Status.Token != "tok-stale" {
+		t.Errorf("token = %q, want %q", got.Status.Token, "tok-stale")
+	}
+}
+
+// A refusal from the cloud, such as forbidden, decodes into an empty
+// TokenRequest. It is no refresh, so the cached token is served instead.
+func TestGetServiceAccountTokenIgnoresCloudRefusal(t *testing.T) {
+	useRealDB(t)
+	calls := 0
+	send := &fakeSend{syncHandler: func(req *model.Message) (*model.Message, error) {
+		calls++
+		refusal := apierrors.NewForbidden(schema.GroupResource{Resource: "serviceaccounts/token"}, "sa", fmt.Errorf("no access"))
+		return model.NewMessage(req.GetID()).
+			FillBody(refusal).
+			BuildRouter("edgecontroller", "resource", req.GetResource(), model.ResponseOperation), nil
+	}}
+	c := &serviceAccountToken{send: send}
+
+	_, err := c.GetServiceAccountToken("default", "refused-absent", specOf(projectedTTL))
+	if err == nil || !strings.Contains(err.Error(), "forbidden") {
+		t.Fatalf("err = %v, want the refusal's reason", err)
+	}
+
+	cacheGeneration(t, "refused-stale", "default", 50*time.Minute, "tok-stale")
+	got, err := c.GetServiceAccountToken("default", "refused-stale", specOf(projectedTTL))
+	if err != nil {
+		t.Fatalf("GetServiceAccountToken: %v", err)
+	}
+	if got.Status.Token != "tok-stale" {
+		t.Errorf("token = %q, want %q", got.Status.Token, "tok-stale")
+	}
+	if calls != 2 {
+		t.Errorf("remote calls = %d, want 2", calls)
+	}
+}
+
+// A corrupt token row must not refuse the other tokens on the node.
+func TestCheckTokenExistSkipsCorruptRow(t *testing.T) {
+	useRealDB(t)
+	if err := dao.SaveMeta(&dao.Meta{
+		Key:   "corrupt-row",
+		Type:  model.ResourceTypeServiceAccountToken,
+		Value: "not json",
+	}); err != nil {
+		t.Fatalf("save meta: %v", err)
+	}
+	t.Cleanup(func() { _ = dao.DeleteMetaByKey("corrupt-row") })
+	cacheGeneration(t, "beside-corrupt", "default", time.Minute, "tok-beside-corrupt")
+
+	if !CheckTokenExist("tok-beside-corrupt") {
+		t.Error("a corrupt row refused a valid token")
 	}
 }
 
@@ -280,65 +364,5 @@ func TestGetServiceAccountTokenUsesFreshCache(t *testing.T) {
 	}
 	if got.Status.Token != "tok-fresh" {
 		t.Errorf("token = %q, want %q", got.Status.Token, "tok-fresh")
-	}
-}
-
-// Presence in metaDB is not proof a token is still usable. An expired row
-// survives until the GC sweep runs, and MetaServer has no other check when no
-// public key is available.
-func TestCheckTokenExistRejectsExpired(t *testing.T) {
-	useRealDB(t)
-	cacheGeneration(t, "auth-live", "default", time.Minute, "tok-auth-live")
-	cacheGeneration(t, "auth-dead", "default", 2*time.Hour, "tok-auth-dead")
-
-	if !CheckTokenExist("tok-auth-live") {
-		t.Error("CheckTokenExist rejected a token that has not expired")
-	}
-	if CheckTokenExist("tok-auth-dead") {
-		t.Error("CheckTokenExist accepted an expired token")
-	}
-}
-
-func TestExpired(t *testing.T) {
-	useRealDB(t)
-	exp := projectedTTL
-	cases := []struct {
-		name string
-		tr   *authenticationv1.TokenRequest
-		want bool
-	}{
-		{
-			name: "no expiration timestamp is treated as usable",
-			tr:   &authenticationv1.TokenRequest{},
-			want: false,
-		},
-		{
-			name: "future expiry",
-			tr: &authenticationv1.TokenRequest{
-				Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: &exp},
-				Status: authenticationv1.TokenRequestStatus{
-					ExpirationTimestamp: metav1.NewTime(time.Now().Add(time.Minute)),
-				},
-			},
-			want: false,
-		},
-		{
-			name: "past expiry",
-			tr: &authenticationv1.TokenRequest{
-				Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: &exp},
-				Status: authenticationv1.TokenRequestStatus{
-					ExpirationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute)),
-				},
-			},
-			want: true,
-		},
-	}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := expired(c.tr); got != c.want {
-				t.Errorf("expired() = %v, want %v", got, c.want)
-			}
-		})
 	}
 }

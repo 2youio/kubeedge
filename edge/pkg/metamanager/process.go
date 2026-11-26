@@ -361,7 +361,8 @@ func (m *metaManager) processQuery(message model.Message) {
 	}
 
 	if resID == "" {
-		// Get specific type resources
+		// Get specific type resources. Service account token queries land here,
+		// and client.getTokenRemotely takes this reply as "cloud unreachable".
 		metas, err = dao.QueryMeta("type", resType)
 	} else {
 		metas, err = dao.QueryMeta("key", resKey)

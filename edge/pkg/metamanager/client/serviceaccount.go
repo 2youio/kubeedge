@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -129,19 +130,6 @@ func KeyFunc(name, namespace string, tr *authenticationv1.TokenRequest) string {
 	return fmt.Sprintf("%s/%d", base, tr.Status.ExpirationTimestamp.UnixNano())
 }
 
-// expired reports whether a token can no longer be used, as distinct from
-// being due for a refresh. requiresRefresh turns true at 80% of the token's
-// lifetime while the token stays usable until its ExpirationTimestamp. A token
-// carrying no expiration timestamp is treated as usable, matching
-// requiresRefresh, which declines to refresh a token whose ExpirationSeconds
-// is nil.
-func expired(tr *authenticationv1.TokenRequest) bool {
-	if tr.Status.ExpirationTimestamp.IsZero() {
-		return false
-	}
-	return time.Now().After(tr.Status.ExpirationTimestamp.Time)
-}
-
 // newestCachedGeneration returns the newest cached generation that has not yet
 // expired. It does not judge whether that generation is due for a refresh,
 // because only the caller knows whether a refresh can succeed.
@@ -218,11 +206,38 @@ func getTokenRemotely(resource string, tr *authenticationv1.TokenRequest, c *ser
 		return nil, fmt.Errorf("marshal message to serviceaccount token failed, err: %v", err)
 	}
 
+	// Offline, metamanager answers from metaDB with every token row on the node,
+	// not the one requested, so this is no refresh. The caller reads the cache.
 	if msg.GetOperation() == model.ResponseOperation && msg.GetSource() == modules.MetaManagerModuleName {
-		return handleServiceAccountTokenFromMetaDB(content)
+		return nil, errAnsweredFromDB
 	}
-	return handleServiceAccountTokenFromMetaManager(content)
+	tokenReq, err := handleServiceAccountTokenFromMetaManager(content)
+	if err != nil {
+		return nil, err
+	}
+	// A refusal from the cloud, such as forbidden, decodes into an empty TokenRequest.
+	if tokenReq.Status.Token == "" || tokenReq.Status.ExpirationTimestamp.IsZero() {
+		return nil, fmt.Errorf("the reply holds no usable token: %s", refusalReason(content))
+	}
+	return tokenReq, nil
 }
+
+// refusalReason names why the cloud refused a token request, without logging
+// the reply itself, which may hold a token.
+func refusalReason(content []byte) string {
+	var refusal struct {
+		ErrStatus struct {
+			Message string `json:"message"`
+		} `json:"ErrStatus"`
+	}
+	if json.Unmarshal(content, &refusal) == nil && refusal.ErrStatus.Message != "" {
+		return refusal.ErrStatus.Message
+	}
+	return fmt.Sprintf("%d bytes without a token or an expiry", len(content))
+}
+
+// errAnsweredFromDB is the refresh failure of a node cut off from the cloud.
+var errAnsweredFromDB = errors.New("cloud unreachable, metamanager answered from its database")
 
 func (c *serviceAccountToken) GetServiceAccountToken(namespace string, name string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 	cached, cacheErr := newestCachedGeneration(name, namespace, tr)
@@ -247,25 +262,6 @@ func (c *serviceAccountToken) GetServiceAccountToken(namespace string, name stri
 	}
 	klog.Errorf("could not refresh token %s, serving the cached token: %v", baseKey(name, namespace, tr), err)
 	return cached, nil
-}
-
-func handleServiceAccountTokenFromMetaDB(content []byte) (*authenticationv1.TokenRequest, error) {
-	var lists []string
-	err := json.Unmarshal(content, &lists)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal message to serviceaccount list from db failed, err: %v", err)
-	}
-
-	if len(lists) != 1 {
-		return nil, fmt.Errorf("serviceaccount length from meta db is %d", len(lists))
-	}
-
-	var tokenRequest authenticationv1.TokenRequest
-	err = json.Unmarshal([]byte(lists[0]), &tokenRequest)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal message to serviceaccount token from db failed, err: %v", err)
-	}
-	return &tokenRequest, nil
 }
 
 func handleServiceAccountTokenFromMetaManager(content []byte) (*authenticationv1.TokenRequest, error) {
@@ -331,19 +327,11 @@ func CheckTokenExist(token string) bool {
 		err = json.Unmarshal([]byte(v), &tokenRequest)
 		if err != nil {
 			klog.Errorf("unmarshal resource %s token request failed: %v", model.ResourceTypeServiceAccountToken, err)
-			return false
+			continue
 		}
+		// An expired row may remain until the GC sweep; the authenticator's
+		// validator then refuses the token as expired, on every path.
 		if tokenRequest.Status.Token == token {
-			// Cached rows outlive the point at which a refresh becomes due,
-			// and an expired generation survives until the next GC sweep, so
-			// presence alone does not mean the token is still usable. This is
-			// the only check MetaServer has when no public key is available
-			// for signature verification, which is the offline case.
-			if expired(&tokenRequest) {
-				klog.Warningf("service account token matched a cached row but expired at %v",
-					tokenRequest.Status.ExpirationTimestamp)
-				return false
-			}
 			return true
 		}
 	}

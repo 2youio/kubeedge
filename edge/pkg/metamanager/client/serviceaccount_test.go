@@ -233,79 +233,6 @@ func TestKeyFunc(t *testing.T) {
 	})
 }
 
-func TestHandleServiceAccountTokenFromMetaDB(t *testing.T) {
-	assert := assert.New(t)
-
-	// Test case 1: Valid TokenRequest JSON in array
-	validTokenRequest := &authenticationv1.TokenRequest{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-token-request",
-		},
-		Spec: authenticationv1.TokenRequestSpec{
-			Audiences: []string{"audience1", "audience2"},
-		},
-		Status: authenticationv1.TokenRequestStatus{
-			Token: "test-token",
-		},
-	}
-	tokenRequestJSON, err := json.Marshal(validTokenRequest)
-	if err != nil {
-		t.Fatalf("Failed to marshal valid token request: %v", err)
-	}
-	validContent, err := json.Marshal([]string{string(tokenRequestJSON)})
-	if err != nil {
-		t.Fatalf("Failed to marshal valid content: %v", err)
-	}
-
-	tokenRequest, err := handleServiceAccountTokenFromMetaDB(validContent)
-	assert.NoError(err)
-	assert.NotNil(tokenRequest)
-	assert.Equal(validTokenRequest.Name, tokenRequest.Name)
-	assert.Equal(validTokenRequest.Spec.Audiences, tokenRequest.Spec.Audiences)
-	assert.Equal(validTokenRequest.Status.Token, tokenRequest.Status.Token)
-
-	// Test case 2: Invalid JSON
-	invalidContent := []byte("invalid json")
-
-	tokenRequest, err = handleServiceAccountTokenFromMetaDB(invalidContent)
-	assert.Error(err)
-	assert.Nil(tokenRequest)
-	assert.Contains(err.Error(), "unmarshal message to serviceaccount list from db failed")
-
-	// Test case 3: Empty array
-	emptyContent, err := json.Marshal([]string{})
-	if err != nil {
-		t.Fatalf("Failed to marshal empty content: %v", err)
-	}
-
-	tokenRequest, err = handleServiceAccountTokenFromMetaDB(emptyContent)
-	assert.Error(err)
-	assert.Nil(tokenRequest)
-	assert.Contains(err.Error(), "serviceaccount length from meta db is 0")
-
-	// Test case 4: Array with multiple elements
-	multipleContent, err := json.Marshal([]string{"{}", "{}"})
-	if err != nil {
-		t.Fatalf("Failed to marshal multiple content: %v", err)
-	}
-
-	tokenRequest, err = handleServiceAccountTokenFromMetaDB(multipleContent)
-	assert.Error(err)
-	assert.Nil(tokenRequest)
-	assert.Contains(err.Error(), "serviceaccount length from meta db is 2")
-
-	// Test case 5: Invalid TokenRequest JSON in the array
-	invalidTokenRequestContent, err := json.Marshal([]string{"{invalid json}"})
-	if err != nil {
-		t.Fatalf("Failed to marshal invalid token request content: %v", err)
-	}
-
-	tokenRequest, err = handleServiceAccountTokenFromMetaDB(invalidTokenRequestContent)
-	assert.Error(err)
-	assert.Nil(tokenRequest)
-	assert.Contains(err.Error(), "unmarshal message to serviceaccount token from db failed")
-}
-
 func TestHandleServiceAccountTokenFromMetaManager(t *testing.T) {
 	assert := assert.New(t)
 
@@ -811,7 +738,8 @@ func TestGetServiceAccountToken(t *testing.T) {
 	responseMsg := model.NewMessage("")
 	remoteToken := &authenticationv1.TokenRequest{
 		Status: authenticationv1.TokenRequestStatus{
-			Token: "remote-token",
+			Token:               "remote-token",
+			ExpirationTimestamp: metav1.NewTime(time.Now().Add(time.Hour)),
 		},
 	}
 	remoteTokenBytes, err := json.Marshal(remoteToken)
