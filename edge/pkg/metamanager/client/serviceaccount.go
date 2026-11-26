@@ -260,7 +260,11 @@ func (c *serviceAccountToken) GetServiceAccountToken(namespace string, name stri
 	if cacheErr != nil {
 		return nil, err
 	}
-	klog.Errorf("could not refresh token %s, serving the cached token: %v", baseKey(name, namespace, tr), err)
+	if errors.Is(err, errAnsweredFromDB) {
+		klog.V(2).Infof("could not refresh token %s, serving the cached token: %v", baseKey(name, namespace, tr), err)
+	} else {
+		klog.Warningf("could not refresh token %s, serving the cached token: %v", baseKey(name, namespace, tr), err)
+	}
 	return cached, nil
 }
 

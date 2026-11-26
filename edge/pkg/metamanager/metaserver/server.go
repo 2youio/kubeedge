@@ -82,7 +82,7 @@ func buildAuth() *metaServerAuth {
 	tokenAuthenticator := auth.JWTTokenAuthenticator(nil,
 		metaserverconfig.Config.ServiceAccountIssuers, allPublicKeys, metaserverconfig.Config.APIAudiences,
 		auth.NewValidator(client.NewGetterFromClient(kubeclientbridge.NewSimpleClientset(client.New()))))
-	newAuthenticator := bearertoken.New(tokenAuthenticator)
+	newAuthenticator := auth.QuietRefusals(bearertoken.New(tokenAuthenticator))
 	return &metaServerAuth{newAuthenticator, newAuthorizer}
 }
 
