@@ -127,9 +127,11 @@ func QueryAllMeta(key string, condition string) (*[]Meta, error) {
 }
 
 // QueryMetaByKeyPrefix returns meta values whose Key starts with prefix.
+// The match is exact and case-sensitive. LIKE is not used because SQLite's
+// LIKE ignores ASCII case and treats "%" and "_" in the prefix as wildcards.
 func QueryMetaByKeyPrefix(prefix string) (*[]string, error) {
 	meta := new([]Meta)
-	_, err := dbm.DBAccess.Raw("SELECT * FROM meta WHERE key LIKE ?", prefix+"%").QueryRows(meta)
+	_, err := dbm.DBAccess.Raw("SELECT * FROM meta WHERE substr(key, 1, length(?)) = ?", prefix, prefix).QueryRows(meta)
 	if err != nil {
 		return nil, err
 	}
