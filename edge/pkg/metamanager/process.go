@@ -361,7 +361,8 @@ func (m *metaManager) processQuery(message model.Message) {
 	}
 
 	if resID == "" {
-		// Get specific type resources
+		// Get specific type resources. Service account token queries land here,
+		// and client.getTokenRemotely takes this reply as "cloud unreachable".
 		metas, err = dao.QueryMeta("type", resType)
 	} else {
 		metas, err = dao.QueryMeta("key", resKey)
@@ -414,12 +415,49 @@ func (m *metaManager) processRemote(message model.Message) {
 			klog.V(4).Infof("process remote objResp: %+v", mapContent["Object"])
 			respDB.Content = mapContent["Object"]
 		}
-		if err := m.handleMessage(&respDB); err != nil {
-			feedbackError(err, message)
-			return
+		if row := tokenRowForRequest(&message, &respDB); row != nil {
+			if err := m.handleMessage(row); err != nil {
+				feedbackError(err, message)
+				return
+			}
 		}
 		feedbackResponse(&message, originalID, &resp)
 	}()
+}
+
+// tokenRowForRequest stores a service account token under the spec kubelet asked for,
+// with the token and expiry of the reply, because the API server fills in default audiences.
+// It returns nil for a token reply with no token or expiry, such as a cloud refusal.
+func tokenRowForRequest(req, resp *model.Message) *model.Message {
+	if _, resType, _ := parseResource(req); resType != model.ResourceTypeServiceAccountToken {
+		return resp
+	}
+	var got authenticationv1.TokenRequest
+	respData, err := resp.GetContentData()
+	if err == nil {
+		err = json.Unmarshal(respData, &got)
+	}
+	if err != nil {
+		klog.Warningf("do not store the reply to token %s: %v", req.GetResource(), err)
+		return nil
+	}
+	if got.Status.Token == "" || got.Status.ExpirationTimestamp.IsZero() {
+		klog.V(4).Infof("do not store the reply to token %s: it has no token or no expiry", req.GetResource())
+		return nil
+	}
+	var asked authenticationv1.TokenRequest
+	reqData, err := req.GetContentData()
+	if err == nil {
+		err = json.Unmarshal(reqData, &asked)
+	}
+	if err != nil {
+		klog.Warningf("store token %s under the reply's spec: %v", req.GetResource(), err)
+		return resp
+	}
+	got.Spec = asked.Spec
+	row := *resp
+	row.Content = &got
+	return &row
 }
 
 func isObjectResp(data map[string]interface{}) bool {

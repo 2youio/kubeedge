@@ -2,7 +2,9 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -100,7 +102,12 @@ func baseKey(name, namespace string, tr *authenticationv1.TokenRequest) string {
 		ref = *tr.Spec.BoundObjectRef
 	}
 
-	return fmt.Sprintf("%q/%q/%#v/%#v/%#v", name, namespace, tr.Spec.Audiences, exp, ref)
+	// No audiences is one key whether the slice is nil or empty.
+	auds := tr.Spec.Audiences
+	if len(auds) == 0 {
+		auds = nil
+	}
+	return fmt.Sprintf("%q/%q/%#v/%#v/%#v", name, namespace, auds, exp, ref)
 }
 
 // KeyFunc returns the per-generation storage key for a TokenRequest. The key
@@ -129,7 +136,10 @@ func KeyFunc(name, namespace string, tr *authenticationv1.TokenRequest) string {
 	return fmt.Sprintf("%s/%d", base, tr.Status.ExpirationTimestamp.UnixNano())
 }
 
-func getTokenLocally(name, namespace string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+// newestCachedGeneration returns the newest cached generation that has not yet
+// expired. It does not judge whether that generation is due for a refresh,
+// because only the caller knows whether a refresh can succeed.
+func newestCachedGeneration(name, namespace string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 	prefix := baseKey(name, namespace, tr)
 	metas, err := dao.QueryMetaByKeyPrefix(prefix)
 	if err != nil {
@@ -163,19 +173,6 @@ func getTokenLocally(name, namespace string, tr *authenticationv1.TokenRequest) 
 	if newest == nil {
 		return nil, fmt.Errorf("no un-expired cached token for %s", prefix)
 	}
-
-	if requiresRefresh(newest) {
-		// The freshest cached generation is past the 80%-of-TTL threshold;
-		// trigger a remote refresh. Do NOT delete any cached rows here:
-		// MetaServer authenticates pod requests by checking presence of the
-		// token in metaDB (see CheckTokenExist). The previous patch removed
-		// the eviction of this row; this patch additionally arranges for
-		// the refreshed token to be stored under a *new* per-generation key
-		// (see KeyFunc), so both rows coexist for a brief window. GC
-		// (RunExpiredTokenGC) removes rows whose exp has passed.
-		klog.V(4).Infof("resource %s token requires refresh", prefix)
-		return nil, fmt.Errorf("resource %s token requires refresh", prefix)
-	}
 	return newest, nil
 }
 
@@ -193,38 +190,104 @@ func getTokenRemotely(resource string, tr *authenticationv1.TokenRequest, c *ser
 		return nil, fmt.Errorf("marshal message to serviceaccount token failed, err: %v", err)
 	}
 
+	// Offline, metamanager answers from metaDB with every token row on the node,
+	// not the one requested, so this is no refresh. The caller reads the cache.
 	if msg.GetOperation() == model.ResponseOperation && msg.GetSource() == modules.MetaManagerModuleName {
-		return handleServiceAccountTokenFromMetaDB(content)
+		return nil, errAnsweredFromDB
 	}
-	return handleServiceAccountTokenFromMetaManager(content)
-}
-
-func (c *serviceAccountToken) GetServiceAccountToken(namespace string, name string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
-	tokenReq, err := getTokenLocally(name, namespace, tr)
+	tokenReq, err := handleServiceAccountTokenFromMetaManager(content)
 	if err != nil {
-		resource := fmt.Sprintf("%s/%s/%s", namespace, model.ResourceTypeServiceAccountToken, name)
-		return getTokenRemotely(resource, tr, c)
+		return nil, err
+	}
+	// A refusal from the cloud, such as forbidden, decodes into an empty TokenRequest.
+	if tokenReq.Status.Token == "" || tokenReq.Status.ExpirationTimestamp.IsZero() {
+		return nil, fmt.Errorf("the reply holds no usable token: %s", refusalReason(content))
 	}
 	return tokenReq, nil
 }
 
-func handleServiceAccountTokenFromMetaDB(content []byte) (*authenticationv1.TokenRequest, error) {
-	var lists []string
-	err := json.Unmarshal(content, &lists)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal message to serviceaccount list from db failed, err: %v", err)
+// refusalReason names why the cloud refused a token request, without logging
+// the reply itself, which may hold a token.
+func refusalReason(content []byte) string {
+	var refusal struct {
+		ErrStatus struct {
+			Message string `json:"message"`
+		} `json:"ErrStatus"`
+	}
+	if json.Unmarshal(content, &refusal) == nil && refusal.ErrStatus.Message != "" {
+		return refusal.ErrStatus.Message
+	}
+	return fmt.Sprintf("%d bytes without a token or an expiry", len(content))
+}
+
+// errAnsweredFromDB is the refresh failure of a node cut off from the cloud.
+var errAnsweredFromDB = errors.New("cloud unreachable, metamanager answered from its database")
+
+func (c *serviceAccountToken) GetServiceAccountToken(namespace string, name string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+	cached, cacheErr := newestCachedGeneration(name, namespace, tr)
+	if cacheErr == nil && !requiresRefresh(cached) {
+		return cached, nil
 	}
 
-	if len(lists) != 1 {
-		return nil, fmt.Errorf("serviceaccount length from meta db is %d", len(lists))
+	resource := fmt.Sprintf("%s/%s/%s", namespace, model.ResourceTypeServiceAccountToken, name)
+	refreshed, err := getTokenRemotely(resource, tr, c)
+	if err == nil {
+		refreshFailures.forget(baseKey(name, namespace, tr))
+		return refreshed, nil
 	}
 
-	var tokenRequest authenticationv1.TokenRequest
-	err = json.Unmarshal([]byte(lists[0]), &tokenRequest)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal message to serviceaccount token from db failed, err: %v", err)
+	// The refresh failed, which on an edge node usually means the cloud is
+	// unreachable. newestCachedGeneration only returns a generation that has
+	// not expired, so anything it handed back is still usable. Serving it lets
+	// a disconnected node keep starting pods that mount a service account
+	// token, which is the case edge autonomy exists to cover. Upstream kubelet
+	// makes the same choice in pkg/kubelet/token/token_manager.go.
+	if cacheErr != nil {
+		return nil, err
 	}
-	return &tokenRequest, nil
+	key := baseKey(name, namespace, tr)
+	switch {
+	case errors.Is(err, errAnsweredFromDB):
+		klog.V(2).Infof("could not refresh token %s, serving the cached token: %v", key, err)
+	case refreshFailures.first(key):
+		klog.Warningf("could not refresh token %s, serving the cached token until a refresh succeeds: %v", key, err)
+	default:
+		klog.V(4).Infof("could not refresh token %s, serving the cached token: %v", key, err)
+	}
+	return cached, nil
+}
+
+// maxWarnedTokens bounds the memory of tokens already warned about. When it is
+// full, it is emptied, so a token may then be warned about once more.
+const maxWarnedTokens = 4096
+
+// warnedTokens remembers the tokens whose failed refresh was logged as a warning,
+// so kubelet's retry on every pod sync does not log it again.
+type warnedTokens struct {
+	mu   sync.Mutex
+	keys map[string]struct{}
+}
+
+var refreshFailures = &warnedTokens{keys: make(map[string]struct{})}
+
+// first reports whether this is the first failure of key since it was last forgotten.
+func (w *warnedTokens) first(key string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, seen := w.keys[key]; seen {
+		return false
+	}
+	if len(w.keys) >= maxWarnedTokens {
+		clear(w.keys)
+	}
+	w.keys[key] = struct{}{}
+	return true
+}
+
+func (w *warnedTokens) forget(key string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.keys, key)
 }
 
 func handleServiceAccountTokenFromMetaManager(content []byte) (*authenticationv1.TokenRequest, error) {
@@ -290,8 +353,10 @@ func CheckTokenExist(token string) bool {
 		err = json.Unmarshal([]byte(v), &tokenRequest)
 		if err != nil {
 			klog.Errorf("unmarshal resource %s token request failed: %v", model.ResourceTypeServiceAccountToken, err)
-			return false
+			continue
 		}
+		// An expired row may remain until the GC sweep; the authenticator's
+		// validator then refuses the token as expired, on every path.
 		if tokenRequest.Status.Token == token {
 			return true
 		}

@@ -1,0 +1,387 @@
+/*
+Copyright 2026 The KubeEdge Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+   http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package client
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	authenticationv1 "k8s.io/api/authentication/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/beego/beego/v2/client/orm"
+
+	"github.com/kubeedge/beehive/pkg/core/model"
+	"github.com/kubeedge/kubeedge/edge/pkg/common/dbm"
+	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
+	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao"
+)
+
+// projectedTTL is the lifetime kubelet requests for a projected service
+// account token volume.
+const projectedTTL int64 = 3607
+
+// These tests drive a real sqlite metaDB rather than stubbing the data layer,
+// so they exercise the per-generation key scheme end to end.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "kubeedge-sa-offline")
+	if err != nil {
+		panic(err)
+	}
+	orm.RegisterModel(new(dao.Meta))
+	dbm.InitDBConfig("sqlite3", "default", filepath.Join(dir, "edgecore.db"))
+	realDB = orm.NewOrmUsingDB("default")
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+// realDB is the sqlite ormer. Other tests in this package swap dbm.DBAccess
+// for a mock, so each test here puts the real one back for its duration.
+var realDB orm.Ormer
+
+func useRealDB(t *testing.T) {
+	t.Helper()
+	prev := dbm.DBAccess
+	dbm.DBAccess = realDB
+	t.Cleanup(func() { dbm.DBAccess = prev })
+}
+
+// offlineSend fails every sync send, which is what an edge node that has lost
+// its connection to the cloud sees.
+type offlineSend struct{}
+
+func (offlineSend) SendSync(*model.Message) (*model.Message, error) {
+	return nil, fmt.Errorf("timeout to get response")
+}
+func (offlineSend) Send(*model.Message) {}
+
+func specOf(ttl int64) *authenticationv1.TokenRequest {
+	exp := ttl
+	return &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: &exp},
+	}
+}
+
+// cacheGeneration stores one generation of a token, issued age ago, under the
+// per-generation key that metamanager would use for it.
+func cacheGeneration(t *testing.T, name, namespace string, age time.Duration, token string) *authenticationv1.TokenRequest {
+	t.Helper()
+	exp := projectedTTL
+	issued := time.Now().Add(-age)
+	tr := &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: &exp},
+		Status: authenticationv1.TokenRequestStatus{
+			Token:               token,
+			ExpirationTimestamp: metav1.NewTime(issued.Add(time.Duration(projectedTTL) * time.Second)),
+		},
+	}
+	value, err := json.Marshal(tr)
+	if err != nil {
+		t.Fatalf("marshal token: %v", err)
+	}
+	if err := dao.SaveMeta(&dao.Meta{
+		Key:   KeyFunc(name, namespace, tr),
+		Type:  model.ResourceTypeServiceAccountToken,
+		Value: string(value),
+	}); err != nil {
+		t.Fatalf("save meta: %v", err)
+	}
+	return tr
+}
+
+// A refresh stores the new token under its own key, so the previous generation
+// survives the propagation window during which a pod may still present it.
+func TestGenerationsCoexistAcrossRefresh(t *testing.T) {
+	useRealDB(t)
+	const name, namespace = "coexist", "default"
+	cacheGeneration(t, name, namespace, 50*time.Minute, "tok-old")
+	cacheGeneration(t, name, namespace, time.Minute, "tok-new")
+
+	rows, err := dao.QueryMetaByKeyPrefix(baseKey(name, namespace, specOf(projectedTTL)))
+	if err != nil {
+		t.Fatalf("query by prefix: %v", err)
+	}
+	if rows == nil || len(*rows) != 2 {
+		t.Fatalf("cached generations = %d, want 2", len(*rows))
+	}
+
+	// Both remain usable for authentication while they are un-expired.
+	if !CheckTokenExist("tok-old") {
+		t.Error("the previous generation was rejected while it was still valid")
+	}
+	if !CheckTokenExist("tok-new") {
+		t.Error("the refreshed generation was rejected")
+	}
+
+	// The newest generation is the one handed to a caller.
+	got, err := newestCachedGeneration(name, namespace, specOf(projectedTTL))
+	if err != nil {
+		t.Fatalf("newestCachedGeneration: %v", err)
+	}
+	if got.Status.Token != "tok-new" {
+		t.Errorf("token = %q, want %q", got.Status.Token, "tok-new")
+	}
+}
+
+// With the cloud unreachable and a cached token that is past the refresh
+// threshold but not expired, the cached token is served so the pod can start.
+func TestGetServiceAccountTokenServesStaleTokenWhenOffline(t *testing.T) {
+	useRealDB(t)
+	const name, namespace = "offline-stale", "default"
+	tr := cacheGeneration(t, name, namespace, 50*time.Minute, "tok-stale")
+
+	if !requiresRefresh(tr) {
+		t.Fatal("precondition failed: token is not yet due for refresh")
+	}
+	if !tr.Status.ExpirationTimestamp.After(time.Now()) {
+		t.Fatal("precondition failed: token has already expired")
+	}
+
+	c := &serviceAccountToken{send: offlineSend{}}
+	got, err := c.GetServiceAccountToken(namespace, name, specOf(projectedTTL))
+	if err != nil {
+		t.Fatalf("GetServiceAccountToken: %v", err)
+	}
+	if got.Status.Token != "tok-stale" {
+		t.Errorf("token = %q, want %q", got.Status.Token, "tok-stale")
+	}
+}
+
+// An expired cached generation cannot be served, so the refresh failure
+// surfaces instead.
+func TestGetServiceAccountTokenRejectsExpiredWhenOffline(t *testing.T) {
+	useRealDB(t)
+	const name, namespace = "offline-expired", "default"
+	cacheGeneration(t, name, namespace, 2*time.Hour, "tok-expired")
+
+	c := &serviceAccountToken{send: offlineSend{}}
+	if _, err := c.GetServiceAccountToken(namespace, name, specOf(projectedTTL)); err == nil {
+		t.Fatal("expected an error for an expired cached token")
+	}
+}
+
+// With nothing cached and no cloud, there is nothing to serve.
+func TestGetServiceAccountTokenFailsWithNoCacheWhenOffline(t *testing.T) {
+	useRealDB(t)
+	c := &serviceAccountToken{send: offlineSend{}}
+	if _, err := c.GetServiceAccountToken("default", "absent", specOf(projectedTTL)); err == nil {
+		t.Fatal("expected an error when no token is cached")
+	}
+}
+
+// Offline, metamanager answers a token query from metaDB with every token row
+// on the node. That answer is no refresh: another pod's token must not be
+// handed out, and a cached token of this pod is served instead.
+func TestGetServiceAccountTokenIgnoresMetaDBReply(t *testing.T) {
+	useRealDB(t)
+	other, err := json.Marshal(cacheGeneration(t, "dbreply-other", "default", time.Minute, "tok-other"))
+	if err != nil {
+		t.Fatalf("marshal token: %v", err)
+	}
+	send := &fakeSend{syncHandler: func(req *model.Message) (*model.Message, error) {
+		resp := req.NewRespByMessage(req, []string{string(other)})
+		resp.SetRoute(modules.MetaManagerModuleName, resp.GetGroup())
+		return resp, nil
+	}}
+	c := &serviceAccountToken{send: send}
+
+	if got, err := c.GetServiceAccountToken("default", "dbreply-absent", specOf(projectedTTL)); err == nil {
+		t.Fatalf("got token %q from the metaDB reply, want an error", got.Status.Token)
+	}
+
+	cacheGeneration(t, "dbreply-stale", "default", 50*time.Minute, "tok-stale")
+	got, err := c.GetServiceAccountToken("default", "dbreply-stale", specOf(projectedTTL))
+	if err != nil {
+		t.Fatalf("GetServiceAccountToken: %v", err)
+	}
+	if got.Status.Token != "tok-stale" {
+		t.Errorf("token = %q, want %q", got.Status.Token, "tok-stale")
+	}
+}
+
+// A refusal from the cloud, such as forbidden, decodes into an empty
+// TokenRequest. It is no refresh, so the cached token is served instead.
+func TestGetServiceAccountTokenIgnoresCloudRefusal(t *testing.T) {
+	useRealDB(t)
+	calls := 0
+	send := &fakeSend{syncHandler: func(req *model.Message) (*model.Message, error) {
+		calls++
+		refusal := apierrors.NewForbidden(schema.GroupResource{Resource: "serviceaccounts/token"}, "sa", fmt.Errorf("no access"))
+		return model.NewMessage(req.GetID()).
+			FillBody(refusal).
+			BuildRouter("edgecontroller", "resource", req.GetResource(), model.ResponseOperation), nil
+	}}
+	c := &serviceAccountToken{send: send}
+
+	_, err := c.GetServiceAccountToken("default", "refused-absent", specOf(projectedTTL))
+	if err == nil || !strings.Contains(err.Error(), "forbidden") {
+		t.Fatalf("err = %v, want the refusal's reason", err)
+	}
+
+	cacheGeneration(t, "refused-stale", "default", 50*time.Minute, "tok-stale")
+	got, err := c.GetServiceAccountToken("default", "refused-stale", specOf(projectedTTL))
+	if err != nil {
+		t.Fatalf("GetServiceAccountToken: %v", err)
+	}
+	if got.Status.Token != "tok-stale" {
+		t.Errorf("token = %q, want %q", got.Status.Token, "tok-stale")
+	}
+	if calls != 2 {
+		t.Errorf("remote calls = %d, want 2", calls)
+	}
+}
+
+// A corrupt token row must not refuse the other tokens on the node.
+func TestCheckTokenExistSkipsCorruptRow(t *testing.T) {
+	useRealDB(t)
+	if err := dao.SaveMeta(&dao.Meta{
+		Key:   "corrupt-row",
+		Type:  model.ResourceTypeServiceAccountToken,
+		Value: "not json",
+	}); err != nil {
+		t.Fatalf("save meta: %v", err)
+	}
+	t.Cleanup(func() { _ = dao.DeleteMetaByKey("corrupt-row") })
+	cacheGeneration(t, "beside-corrupt", "default", time.Minute, "tok-beside-corrupt")
+
+	if !CheckTokenExist("tok-beside-corrupt") {
+		t.Error("a corrupt row refused a valid token")
+	}
+}
+
+// With nothing cached, the token is fetched from the cloud. This is the first
+// request for every new pod, so a cache miss must not end the lookup.
+func TestGetServiceAccountTokenFetchesRemotelyWithNoCache(t *testing.T) {
+	useRealDB(t)
+	exp := projectedTTL
+	remote := &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: &exp},
+		Status: authenticationv1.TokenRequestStatus{
+			Token:               "tok-remote",
+			ExpirationTimestamp: metav1.NewTime(time.Now().Add(time.Hour)),
+		},
+	}
+	send := &fakeSend{syncHandler: func(*model.Message) (*model.Message, error) {
+		return model.NewMessage("").FillBody(remote), nil
+	}}
+
+	c := &serviceAccountToken{send: send}
+	got, err := c.GetServiceAccountToken("default", "first-request", specOf(projectedTTL))
+	if err != nil {
+		t.Fatalf("GetServiceAccountToken: %v", err)
+	}
+	if got.Status.Token != "tok-remote" {
+		t.Errorf("token = %q, want %q", got.Status.Token, "tok-remote")
+	}
+}
+
+// The prefix lookup matches the cached key exactly. A token cached for a
+// different audience must not be returned when the audiences differ only in
+// case, or by a character that SQL LIKE would treat as a wildcard.
+func TestQueryMetaByKeyPrefixIsExact(t *testing.T) {
+	useRealDB(t)
+	const name, namespace = "exact-prefix", "default"
+	exp := projectedTTL
+	withAudience := func(aud string) *authenticationv1.TokenRequest {
+		return &authenticationv1.TokenRequest{
+			Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: &exp, Audiences: []string{aud}},
+		}
+	}
+	for _, aud := range []string{"Vault", "aXb", "café"} {
+		tr := withAudience(aud)
+		tr.Status = authenticationv1.TokenRequestStatus{
+			Token:               "tok-" + aud,
+			ExpirationTimestamp: metav1.NewTime(time.Now().Add(time.Hour)),
+		}
+		value, err := json.Marshal(tr)
+		if err != nil {
+			t.Fatalf("marshal token: %v", err)
+		}
+		if err := dao.SaveMeta(&dao.Meta{
+			Key:   KeyFunc(name, namespace, tr),
+			Type:  model.ResourceTypeServiceAccountToken,
+			Value: string(value),
+		}); err != nil {
+			t.Fatalf("save meta: %v", err)
+		}
+	}
+
+	for _, aud := range []string{"vault", "a_b", "a%b"} {
+		rows, err := dao.QueryMetaByKeyPrefix(baseKey(name, namespace, withAudience(aud)))
+		if err != nil {
+			t.Fatalf("query by prefix for audience %q: %v", aud, err)
+		}
+		if len(*rows) != 0 {
+			t.Errorf("audience %q matched %d cached rows of other audiences, want 0", aud, len(*rows))
+		}
+	}
+
+	// Exact matches are still found, including a prefix with multi-byte
+	// characters, where a byte length and SQLite's character length differ.
+	for _, aud := range []string{"Vault", "café"} {
+		rows, err := dao.QueryMetaByKeyPrefix(baseKey(name, namespace, withAudience(aud)))
+		if err != nil {
+			t.Fatalf("query by prefix for audience %q: %v", aud, err)
+		}
+		if len(*rows) != 1 {
+			t.Errorf("audience %q matched %d rows, want 1", aud, len(*rows))
+		}
+	}
+}
+
+// A fresh cached token is served without consulting the cloud at all.
+func TestGetServiceAccountTokenUsesFreshCache(t *testing.T) {
+	useRealDB(t)
+	const name, namespace = "fresh", "default"
+	cacheGeneration(t, name, namespace, time.Minute, "tok-fresh")
+
+	c := &serviceAccountToken{send: offlineSend{}}
+	got, err := c.GetServiceAccountToken(namespace, name, specOf(projectedTTL))
+	if err != nil {
+		t.Fatalf("GetServiceAccountToken: %v", err)
+	}
+	if got.Status.Token != "tok-fresh" {
+		t.Errorf("token = %q, want %q", got.Status.Token, "tok-fresh")
+	}
+}
+
+// A failed refresh is warned about once per token, and again only after a refresh
+// of that token succeeded.
+func TestRefreshFailureWarnedOncePerToken(t *testing.T) {
+	w := &warnedTokens{keys: make(map[string]struct{})}
+	if !w.first("a") {
+		t.Fatal("the first failure of a is not warned about")
+	}
+	if w.first("a") {
+		t.Error("the second failure of a is warned about")
+	}
+	if !w.first("b") {
+		t.Error("the first failure of b is not warned about")
+	}
+	w.forget("a")
+	if !w.first("a") {
+		t.Error("a failure of a after a successful refresh is not warned about")
+	}
+}

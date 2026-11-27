@@ -233,79 +233,6 @@ func TestKeyFunc(t *testing.T) {
 	})
 }
 
-func TestHandleServiceAccountTokenFromMetaDB(t *testing.T) {
-	assert := assert.New(t)
-
-	// Test case 1: Valid TokenRequest JSON in array
-	validTokenRequest := &authenticationv1.TokenRequest{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-token-request",
-		},
-		Spec: authenticationv1.TokenRequestSpec{
-			Audiences: []string{"audience1", "audience2"},
-		},
-		Status: authenticationv1.TokenRequestStatus{
-			Token: "test-token",
-		},
-	}
-	tokenRequestJSON, err := json.Marshal(validTokenRequest)
-	if err != nil {
-		t.Fatalf("Failed to marshal valid token request: %v", err)
-	}
-	validContent, err := json.Marshal([]string{string(tokenRequestJSON)})
-	if err != nil {
-		t.Fatalf("Failed to marshal valid content: %v", err)
-	}
-
-	tokenRequest, err := handleServiceAccountTokenFromMetaDB(validContent)
-	assert.NoError(err)
-	assert.NotNil(tokenRequest)
-	assert.Equal(validTokenRequest.Name, tokenRequest.Name)
-	assert.Equal(validTokenRequest.Spec.Audiences, tokenRequest.Spec.Audiences)
-	assert.Equal(validTokenRequest.Status.Token, tokenRequest.Status.Token)
-
-	// Test case 2: Invalid JSON
-	invalidContent := []byte("invalid json")
-
-	tokenRequest, err = handleServiceAccountTokenFromMetaDB(invalidContent)
-	assert.Error(err)
-	assert.Nil(tokenRequest)
-	assert.Contains(err.Error(), "unmarshal message to serviceaccount list from db failed")
-
-	// Test case 3: Empty array
-	emptyContent, err := json.Marshal([]string{})
-	if err != nil {
-		t.Fatalf("Failed to marshal empty content: %v", err)
-	}
-
-	tokenRequest, err = handleServiceAccountTokenFromMetaDB(emptyContent)
-	assert.Error(err)
-	assert.Nil(tokenRequest)
-	assert.Contains(err.Error(), "serviceaccount length from meta db is 0")
-
-	// Test case 4: Array with multiple elements
-	multipleContent, err := json.Marshal([]string{"{}", "{}"})
-	if err != nil {
-		t.Fatalf("Failed to marshal multiple content: %v", err)
-	}
-
-	tokenRequest, err = handleServiceAccountTokenFromMetaDB(multipleContent)
-	assert.Error(err)
-	assert.Nil(tokenRequest)
-	assert.Contains(err.Error(), "serviceaccount length from meta db is 2")
-
-	// Test case 5: Invalid TokenRequest JSON in the array
-	invalidTokenRequestContent, err := json.Marshal([]string{"{invalid json}"})
-	if err != nil {
-		t.Fatalf("Failed to marshal invalid token request content: %v", err)
-	}
-
-	tokenRequest, err = handleServiceAccountTokenFromMetaDB(invalidTokenRequestContent)
-	assert.Error(err)
-	assert.Nil(tokenRequest)
-	assert.Contains(err.Error(), "unmarshal message to serviceaccount token from db failed")
-}
-
 func TestHandleServiceAccountTokenFromMetaManager(t *testing.T) {
 	assert := assert.New(t)
 
@@ -475,7 +402,7 @@ func TestDeleteServiceAccountToken(t *testing.T) {
 	sat.DeleteServiceAccountToken(podUID)
 }
 
-func TestGetTokenLocally(t *testing.T) {
+func TestNewestCachedGeneration(t *testing.T) {
 	assert := assert.New(t)
 
 	name := "sa-name"
@@ -521,7 +448,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return nil, errors.New("db error")
 	})
-	result, err := getTokenLocally(name, namespace, tr)
+	result, err := newestCachedGeneration(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
 	assert.Contains(err.Error(), "db error")
@@ -531,7 +458,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return nil, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
 	assert.Contains(err.Error(), "no cached token")
@@ -541,7 +468,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{}, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
 	assert.Contains(err.Error(), "no cached token")
@@ -551,7 +478,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{string(freshBytes)}, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.NoError(err)
 	assert.NotNil(result)
 	assert.Equal("fresh-token", result.Status.Token)
@@ -561,7 +488,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{string(freshBytes), string(newerBytes)}, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.NoError(err)
 	assert.NotNil(result)
 	assert.Equal("newer-token", result.Status.Token)
@@ -571,7 +498,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{string(expiredBytes)}, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
 	assert.Contains(err.Error(), "no un-expired cached token")
@@ -581,7 +508,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{"invalid-json"}, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
 	assert.Contains(err.Error(), "no un-expired cached token")
@@ -591,7 +518,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{"invalid-json", string(expiredBytes), string(freshBytes)}, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.NoError(err)
 	assert.NotNil(result)
 	assert.Equal("fresh-token", result.Status.Token)
@@ -606,11 +533,11 @@ func TestGetTokenLocally(t *testing.T) {
 		deletedKey = k
 		return nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
-	assert.Error(err)
-	assert.Nil(result)
-	assert.Contains(err.Error(), "token requires refresh")
-	assert.Empty(deletedKey, "expired token rows must not be deleted during refresh trigger")
+	result, err = newestCachedGeneration(name, namespace, tr)
+	assert.NoError(err)
+	assert.Equal("near-token", result.Status.Token)
+	assert.True(requiresRefresh(result))
+	assert.Empty(deletedKey, "no cached row may be deleted while looking up the cache")
 }
 
 func TestGcExpiredTokensOnce(t *testing.T) {
@@ -722,14 +649,14 @@ func TestTokenCoexistenceDuringRefreshWindow(t *testing.T) {
 
 	// --- Phase 1: propagation window — both rows coexist in metaDB ---
 
-	// getTokenLocally must return the newer generation, not the near-expiry old one.
+	// newestCachedGeneration must return the newer generation, not the near-expiry old one.
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{string(oldTokenBytes), string(newTokenBytes)}, nil
 	})
 	tr := &authenticationv1.TokenRequest{Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: sec(3600)}}
-	got, err := getTokenLocally("sa", "ns", tr)
+	got, err := newestCachedGeneration("sa", "ns", tr)
 	assert.NoError(err)
-	assert.Equal("new-bearer-token", got.Status.Token, "getTokenLocally must return the freshest generation")
+	assert.Equal("new-bearer-token", got.Status.Token, "newestCachedGeneration must return the freshest generation")
 
 	// CheckTokenExist scans all SA token rows; both bearer strings must be recognised
 	// so MetaServer accepts pods still carrying the old token.
@@ -791,7 +718,7 @@ func TestGetServiceAccountToken(t *testing.T) {
 		},
 	}
 
-	patches.ApplyFunc(getTokenLocally, func(n, ns string, t *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+	patches.ApplyFunc(newestCachedGeneration, func(n, ns string, t *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 		assert.Equal(name, n)
 		assert.Equal(namespace, ns)
 		assert.Equal(tr, t)
@@ -804,14 +731,15 @@ func TestGetServiceAccountToken(t *testing.T) {
 
 	// Test remote token fetching
 	patches.Reset()
-	patches.ApplyFunc(getTokenLocally, func(n, ns string, t *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+	patches.ApplyFunc(newestCachedGeneration, func(n, ns string, t *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 		return nil, errors.New("local token not found")
 	})
 
 	responseMsg := model.NewMessage("")
 	remoteToken := &authenticationv1.TokenRequest{
 		Status: authenticationv1.TokenRequestStatus{
-			Token: "remote-token",
+			Token:               "remote-token",
+			ExpirationTimestamp: metav1.NewTime(time.Now().Add(time.Hour)),
 		},
 	}
 	remoteTokenBytes, err := json.Marshal(remoteToken)
@@ -834,7 +762,7 @@ func TestGetServiceAccountToken(t *testing.T) {
 	assert.Equal("remote-token", result.Status.Token)
 
 	patches.Reset()
-	patches.ApplyFunc(getTokenLocally, func(n, ns string, t *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+	patches.ApplyFunc(newestCachedGeneration, func(n, ns string, t *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 		return nil, errors.New("local token not found")
 	})
 

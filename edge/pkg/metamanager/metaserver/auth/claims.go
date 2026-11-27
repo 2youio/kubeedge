@@ -144,7 +144,7 @@ func (v *validator) NewPrivateClaims() interface{} {
 func parseSigned(tokenData string, dest ...interface{}) error {
 	sig, err := jose.ParseSigned(tokenData)
 	if err != nil {
-		klog.Errorf("failed to parse token: %v", err)
+		klog.V(4).Infof("failed to parse token: %v", err)
 		return err
 	}
 	claims := func(dest ...interface{}) error {
@@ -157,7 +157,7 @@ func parseSigned(tokenData string, dest ...interface{}) error {
 		return nil
 	}
 	if err := claims(dest...); err != nil {
-		klog.Errorf("failed to parse claims: %v", err)
+		klog.V(4).Infof("failed to parse claims: %v", err)
 		return err
 	}
 	return nil
