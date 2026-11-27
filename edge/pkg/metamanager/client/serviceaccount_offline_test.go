@@ -366,3 +366,22 @@ func TestGetServiceAccountTokenUsesFreshCache(t *testing.T) {
 		t.Errorf("token = %q, want %q", got.Status.Token, "tok-fresh")
 	}
 }
+
+// A failed refresh is warned about once per token, and again only after a refresh
+// of that token succeeded.
+func TestRefreshFailureWarnedOncePerToken(t *testing.T) {
+	w := &warnedTokens{keys: make(map[string]struct{})}
+	if !w.first("a") {
+		t.Fatal("the first failure of a is not warned about")
+	}
+	if w.first("a") {
+		t.Error("the second failure of a is warned about")
+	}
+	if !w.first("b") {
+		t.Error("the first failure of b is not warned about")
+	}
+	w.forget("a")
+	if !w.first("a") {
+		t.Error("a failure of a after a successful refresh is not warned about")
+	}
+}

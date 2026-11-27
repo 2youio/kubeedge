@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -175,28 +176,6 @@ func newestCachedGeneration(name, namespace string, tr *authenticationv1.TokenRe
 	return newest, nil
 }
 
-func getTokenLocally(name, namespace string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
-	prefix := baseKey(name, namespace, tr)
-	newest, err := newestCachedGeneration(name, namespace, tr)
-	if err != nil {
-		return nil, err
-	}
-
-	if requiresRefresh(newest) {
-		// The freshest cached generation is past the 80%-of-TTL threshold;
-		// trigger a remote refresh. Do NOT delete any cached rows here:
-		// MetaServer authenticates pod requests by checking presence of the
-		// token in metaDB (see CheckTokenExist). The previous patch removed
-		// the eviction of this row; this patch additionally arranges for
-		// the refreshed token to be stored under a *new* per-generation key
-		// (see KeyFunc), so both rows coexist for a brief window. GC
-		// (RunExpiredTokenGC) removes rows whose exp has passed.
-		klog.V(4).Infof("resource %s token requires refresh", prefix)
-		return nil, fmt.Errorf("resource %s token requires refresh", prefix)
-	}
-	return newest, nil
-}
-
 func getTokenRemotely(resource string, tr *authenticationv1.TokenRequest, c *serviceAccountToken) (*authenticationv1.TokenRequest, error) {
 	tokenMsg := message.BuildMsg(modules.MetaGroup, "", modules.EdgedModuleName, resource, model.QueryOperation, tr)
 	msg, err := c.send.SendSync(tokenMsg)
@@ -253,6 +232,7 @@ func (c *serviceAccountToken) GetServiceAccountToken(namespace string, name stri
 	resource := fmt.Sprintf("%s/%s/%s", namespace, model.ResourceTypeServiceAccountToken, name)
 	refreshed, err := getTokenRemotely(resource, tr, c)
 	if err == nil {
+		refreshFailures.forget(baseKey(name, namespace, tr))
 		return refreshed, nil
 	}
 
@@ -265,12 +245,49 @@ func (c *serviceAccountToken) GetServiceAccountToken(namespace string, name stri
 	if cacheErr != nil {
 		return nil, err
 	}
-	if errors.Is(err, errAnsweredFromDB) {
-		klog.V(2).Infof("could not refresh token %s, serving the cached token: %v", baseKey(name, namespace, tr), err)
-	} else {
-		klog.Warningf("could not refresh token %s, serving the cached token: %v", baseKey(name, namespace, tr), err)
+	key := baseKey(name, namespace, tr)
+	switch {
+	case errors.Is(err, errAnsweredFromDB):
+		klog.V(2).Infof("could not refresh token %s, serving the cached token: %v", key, err)
+	case refreshFailures.first(key):
+		klog.Warningf("could not refresh token %s, serving the cached token until a refresh succeeds: %v", key, err)
+	default:
+		klog.V(4).Infof("could not refresh token %s, serving the cached token: %v", key, err)
 	}
 	return cached, nil
+}
+
+// maxWarnedTokens bounds the memory of tokens already warned about. When it is
+// full, it is emptied, so a token may then be warned about once more.
+const maxWarnedTokens = 4096
+
+// warnedTokens remembers the tokens whose failed refresh was logged as a warning,
+// so kubelet's retry on every pod sync does not log it again.
+type warnedTokens struct {
+	mu   sync.Mutex
+	keys map[string]struct{}
+}
+
+var refreshFailures = &warnedTokens{keys: make(map[string]struct{})}
+
+// first reports whether this is the first failure of key since it was last forgotten.
+func (w *warnedTokens) first(key string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, seen := w.keys[key]; seen {
+		return false
+	}
+	if len(w.keys) >= maxWarnedTokens {
+		clear(w.keys)
+	}
+	w.keys[key] = struct{}{}
+	return true
+}
+
+func (w *warnedTokens) forget(key string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.keys, key)
 }
 
 func handleServiceAccountTokenFromMetaManager(content []byte) (*authenticationv1.TokenRequest, error) {

@@ -1,3 +1,19 @@
+/*
+Copyright 2026 The KubeEdge Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+   http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package metamanager
 
 import (
@@ -6,6 +22,7 @@ import (
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/kubeedge/beehive/pkg/core/model"
@@ -69,5 +86,28 @@ func TestTokenRowForRequestLeavesOtherResources(t *testing.T) {
 	resp := model.NewMessage(req.GetID()).FillBody(map[string]string{"a": "b"})
 	if got := tokenRowForRequest(req, resp); got != resp {
 		t.Error("a configmap reply was changed")
+	}
+}
+
+// A cloud refusal reaches the edge as a map with ErrStatus. It holds no token, so it
+// must not become a row that no expiry ever removes.
+func TestTokenRowForRequestSkipsARefusal(t *testing.T) {
+	exp := int64(3600)
+	asked := &authenticationv1.TokenRequest{Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: &exp}}
+	resource := "default/" + model.ResourceTypeServiceAccountToken + "/sa"
+	req := message.BuildMsg(modules.MetaGroup, "", modules.EdgedModuleName, resource, model.QueryOperation, asked)
+
+	wire, err := json.Marshal(apierrors.NewForbidden(authenticationv1.Resource("serviceaccounts/token"), "sa", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refusal map[string]interface{}
+	if err := json.Unmarshal(wire, &refusal); err != nil {
+		t.Fatal(err)
+	}
+	resp := model.NewMessage(req.GetID()).BuildRouter("edgecontroller", "resource", resource, model.ResponseOperation).FillBody(refusal)
+
+	if row := tokenRowForRequest(req, resp); row != nil {
+		t.Errorf("a refusal would be stored: %+v", row.Content)
 	}
 }

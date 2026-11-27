@@ -402,7 +402,7 @@ func TestDeleteServiceAccountToken(t *testing.T) {
 	sat.DeleteServiceAccountToken(podUID)
 }
 
-func TestGetTokenLocally(t *testing.T) {
+func TestNewestCachedGeneration(t *testing.T) {
 	assert := assert.New(t)
 
 	name := "sa-name"
@@ -448,7 +448,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return nil, errors.New("db error")
 	})
-	result, err := getTokenLocally(name, namespace, tr)
+	result, err := newestCachedGeneration(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
 	assert.Contains(err.Error(), "db error")
@@ -458,7 +458,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return nil, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
 	assert.Contains(err.Error(), "no cached token")
@@ -468,7 +468,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{}, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
 	assert.Contains(err.Error(), "no cached token")
@@ -478,7 +478,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{string(freshBytes)}, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.NoError(err)
 	assert.NotNil(result)
 	assert.Equal("fresh-token", result.Status.Token)
@@ -488,7 +488,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{string(freshBytes), string(newerBytes)}, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.NoError(err)
 	assert.NotNil(result)
 	assert.Equal("newer-token", result.Status.Token)
@@ -498,7 +498,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{string(expiredBytes)}, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
 	assert.Contains(err.Error(), "no un-expired cached token")
@@ -508,7 +508,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{"invalid-json"}, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
 	assert.Contains(err.Error(), "no un-expired cached token")
@@ -518,7 +518,7 @@ func TestGetTokenLocally(t *testing.T) {
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{"invalid-json", string(expiredBytes), string(freshBytes)}, nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
+	result, err = newestCachedGeneration(name, namespace, tr)
 	assert.NoError(err)
 	assert.NotNil(result)
 	assert.Equal("fresh-token", result.Status.Token)
@@ -533,11 +533,11 @@ func TestGetTokenLocally(t *testing.T) {
 		deletedKey = k
 		return nil
 	})
-	result, err = getTokenLocally(name, namespace, tr)
-	assert.Error(err)
-	assert.Nil(result)
-	assert.Contains(err.Error(), "token requires refresh")
-	assert.Empty(deletedKey, "expired token rows must not be deleted during refresh trigger")
+	result, err = newestCachedGeneration(name, namespace, tr)
+	assert.NoError(err)
+	assert.Equal("near-token", result.Status.Token)
+	assert.True(requiresRefresh(result))
+	assert.Empty(deletedKey, "no cached row may be deleted while looking up the cache")
 }
 
 func TestGcExpiredTokensOnce(t *testing.T) {
@@ -649,14 +649,14 @@ func TestTokenCoexistenceDuringRefreshWindow(t *testing.T) {
 
 	// --- Phase 1: propagation window — both rows coexist in metaDB ---
 
-	// getTokenLocally must return the newer generation, not the near-expiry old one.
+	// newestCachedGeneration must return the newer generation, not the near-expiry old one.
 	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(string) (*[]string, error) {
 		return &[]string{string(oldTokenBytes), string(newTokenBytes)}, nil
 	})
 	tr := &authenticationv1.TokenRequest{Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: sec(3600)}}
-	got, err := getTokenLocally("sa", "ns", tr)
+	got, err := newestCachedGeneration("sa", "ns", tr)
 	assert.NoError(err)
-	assert.Equal("new-bearer-token", got.Status.Token, "getTokenLocally must return the freshest generation")
+	assert.Equal("new-bearer-token", got.Status.Token, "newestCachedGeneration must return the freshest generation")
 
 	// CheckTokenExist scans all SA token rows; both bearer strings must be recognised
 	// so MetaServer accepts pods still carrying the old token.
